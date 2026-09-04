@@ -7,17 +7,67 @@ It is designed for a workflow where an agent edits or researches bibliography
 entries, a human reviews the result, and the agent marks only the confirmed
 citation keys. A later content change makes that marker `stale`.
 
+## Requirements
+
+- A current stable Rust toolchain (`rustup update stable`)
+- Git when installing directly from GitHub
+
+`bib` is self-contained after installation. It embeds the jq-compatible `jaq`
+engine and does not require Python, `jq`, or `Url2Bibtex`.
+
 ## Install
 
-```sh
-cargo install --git https://github.com/EvoEvolver/bib
-```
-
-For local development:
+Install the released source directly from GitHub:
 
 ```sh
-cargo install --path .
+cargo install --locked --git https://github.com/EvoEvolver/bib bib-cli
 ```
+
+Verify that Cargo's binary directory is on `PATH`:
+
+```sh
+bib --version
+```
+
+To build and install from a checkout:
+
+```sh
+git clone https://github.com/EvoEvolver/bib.git
+cd bib
+cargo install --locked --path .
+```
+
+To try the CLI without installing it:
+
+```sh
+git clone https://github.com/EvoEvolver/bib.git
+cd bib
+cargo run -- -r '.[].id' references.bib
+```
+
+Re-run the first command with `--force` to upgrade an existing installation.
+
+## Quick start
+
+Inspect the review status of every entry:
+
+```sh
+bib integrity status references.bib
+```
+
+List just the citation keys that need attention:
+
+```sh
+bib -r '.[] | select(.integrity.status != "verified") | .id' references.bib
+```
+
+After reviewing one entry, attach its integrity marker atomically:
+
+```sh
+bib integrity add references.bib --key turing1936 --in-place
+```
+
+The status will become `stale` if any covered field is later changed.
 
 ## Query like jq
 
@@ -59,7 +109,23 @@ cat references.bib | bib -r '.[].fields.doi // empty'
 ```
 
 The familiar jq flags `-c` (compact), `-r` (raw strings), and `-e` (result-based
-exit status) are supported. Querying never modifies the input file.
+exit status) are supported. Multiple files are combined into one input array.
+Use `-` as a filename to read that input from stdin. Querying never modifies an
+input file.
+
+## Command reference
+
+| Command | Purpose |
+| --- | --- |
+| `bib FILTER [FILE ...]` | Run a jq filter and emit JSON |
+| `bib --bibtex FILTER [FILE ...]` | Emit filtered entry objects as BibTeX |
+| `bib integrity status FILE [--json]` | Report `verified`, `stale`, or `unverified` |
+| `bib integrity hash FILE KEY` | Print the expected SHA-256 value |
+| `bib integrity add FILE --key KEY [--in-place]` | Add or refresh approved entries |
+| `bib integrity remove FILE --key KEY [--in-place]` | Remove approval markers |
+
+Run `bib --help`, `bib integrity --help`, or a specific subcommand's `--help`
+for the complete option list.
 
 ## Review workflow
 
@@ -92,6 +158,10 @@ bib integrity add references.bib --all --in-place
 Without `--in-place`, `add` and `remove` write the updated BibTeX to stdout.
 Writes with `--in-place` use an atomic replacement and retain comments,
 `@string` declarations, and unrelated formatting.
+
+Neither command chooses entries implicitly: pass one or more `--key` options or
+the explicit `--all` option. This keeps an agent from marking unrelated entries
+during a partial review.
 
 Other integrity commands:
 
@@ -140,4 +210,3 @@ cargo test
 ```
 
 Licensed under MIT.
-
