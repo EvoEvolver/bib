@@ -7,29 +7,47 @@ It is designed for a workflow where an agent edits or researches bibliography
 entries, a human reviews the result, and the agent marks only the confirmed
 citation keys. A later content change makes that marker `stale`.
 
-## Requirements
-
-- A current stable Rust toolchain (`rustup update stable`)
-- Git when installing directly from GitHub
-
-`bib` is self-contained after installation. It embeds the jq-compatible `jaq`
-engine and does not require Python, `jq`, or `Url2Bibtex`.
-
 ## Install
 
-Install the released source directly from GitHub:
+Linux and macOS users can install the latest prebuilt release without Rust:
 
 ```sh
-cargo install --locked --git https://github.com/EvoEvolver/bib bib-cli
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
 ```
 
-Verify that Cargo's binary directory is on `PATH`:
+The installer supports Linux x86_64/ARM64 and macOS Intel/Apple Silicon. It
+detects the platform, downloads the GitHub Actions build, verifies its SHA-256
+checksum, and installs only the `bib` binary to `~/.local/bin`.
+
+Choose another directory or a specific release with environment variables:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
+  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.1.0 sh
+```
+
+Export the variables first when that reads more clearly:
+
+```sh
+export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.1.0
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
+```
+
+Verify the installation:
 
 ```sh
 bib --version
 ```
 
-To build and install from a checkout:
+`bib` is self-contained after installation. It does not require Rust, Python,
+or `jq`.
+
+### Build from source
+
+Developers with a current stable Rust toolchain can install from a checkout:
 
 ```sh
 git clone https://github.com/EvoEvolver/bib.git
@@ -44,8 +62,6 @@ git clone https://github.com/EvoEvolver/bib.git
 cd bib
 cargo run -- -r '.[].id' references.bib
 ```
-
-Re-run the first command with `--force` to upgrade an existing installation.
 
 ## Quick start
 
@@ -177,8 +193,7 @@ input error. This makes it suitable for CI and agent loops.
 
 ## Integrity format
 
-The marker is compatible with
-[`doomspec/Url2Bibtex`](https://github.com/doomspec/Url2Bibtex):
+The marker uses this deterministic format:
 
 1. Parse the entry and resolve BibTeX string macros.
 2. Lowercase the entry type and field names.
@@ -196,10 +211,10 @@ The marker is compatible with
 }
 ```
 
-The citation key is deliberately excluded for upstream compatibility, so a key
-rename does not invalidate the marker. The marker is a tamper-evident record of
-reviewed content. It is not a digital signature, does not identify the reviewer,
-and does not by itself prove that external metadata is true.
+The citation key is deliberately excluded, so a key rename does not invalidate
+the marker. The marker is a tamper-evident record of reviewed content. It is not
+a digital signature, does not identify the reviewer, and does not by itself
+prove that external metadata is true.
 
 ## Development
 

@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package
+        shell: bash
+        run: |
+          asset="bib-${{ matrix.target }}.tar.gz"
+          mkdir -p dist/package
+          cp "target/${{ matrix.target }}/release/bib" dist/package/bib
+          tar -C dist/package -czf "dist/${asset}" bib
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${asset}" > "dist/${asset}.sha256"
+          else
+            shasum -a 256 "dist/${asset}" > "dist/${asset}.sha256"
+          fi
+          "dist/package/bib" --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bib-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: bib-*
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --generate-notes
+          --title "bib ${GITHUB_REF_NAME}"
+
