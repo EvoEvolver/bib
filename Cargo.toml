@@ -1,0 +1,31 @@
+[package]
+name = "bib-cli"
+version = "0.1.0"
+edition = "2024"
+description = "A jq-like BibTeX CLI with reviewable integrity markers"
+license = "MIT"
+repository = "https://github.com/EvoEvolver/bib"
+
+[[bin]]
+name = "bib"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+jaq-core = "3.1"
+jaq-json = { version = "2.0", features = ["serde"] }
+jaq-std = "3.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_bibtex = "0.7"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3.21"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+strip = true
+lto = "thin"
