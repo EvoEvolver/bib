@@ -12,12 +12,57 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 
+const LONG_ABOUT: &str = "Query and transform BibTeX with jq-compatible filters, then add integrity markers to entries that have been explicitly reviewed. Query input is an array of entry objects; query results go to stdout and never overwrite input files.";
+
+const AFTER_HELP: &str = r#"INPUT OBJECT
+  {
+    "id": "paper1",
+    "type": "article",
+    "fields": {"title": "A Paper", "year": "2026"},
+    "integrity": {"status": "unverified", "expected": "...", "stored": null}
+  }
+
+QUERY EXAMPLES
+  List citation keys that need review:
+    bib -r '.[] | select(.integrity.status != "verified") | .id' refs.bib
+
+  Build a compact review packet:
+    bib -c '[.[] | {id, title: .fields.title, status: .integrity.status}]' refs.bib
+
+  Read stdin or combine multiple files into one input array:
+    bib -r '.[].id' -
+    bib -r '.[].id' first.bib second.bib
+
+EDITING
+  Filters can change entry objects. Use --bibtex to serialize them back to BibTeX:
+    bib --bibtex 'map(if .id == "paper1" then .fields.year = "2026" else . end)' refs.bib > updated.bib
+
+  Query mode writes only to stdout. After replacing a file, changed entries with an
+  existing marker report "stale". Review the result, then approve explicit keys:
+    bib integrity status updated.bib
+    bib integrity add updated.bib --key paper1 --in-place
+
+INTEGRITY
+  verified    Stored integrity matches the current covered fields.
+  stale       A marker exists, but the covered fields have changed.
+  unverified  No integrity marker exists.
+
+  Run 'bib integrity --help' for status, hash, add, and remove commands. Adding
+  integrity always requires one or more --key options or an explicit --all.
+
+EXIT STATUS
+  0  Success (or every selected entry is verified for 'integrity status')
+  2  Invalid input, filter, or operational error
+  3  At least one selected entry is stale or unverified
+  With -e, query mode also follows jq result statuses: 1 for false/null, 4 for no result."#;
+
 #[derive(Parser)]
 #[command(
     name = "bib",
     version,
     about = "Query BibTeX like jq and mark human-reviewed entries",
-    long_about = None,
+    long_about = LONG_ABOUT,
+    after_help = AFTER_HELP,
     args_conflicts_with_subcommands = true
 )]
 struct Cli {

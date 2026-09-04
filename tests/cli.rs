@@ -19,6 +19,26 @@ const SAMPLE: &str = r#"% retained comment
 "#;
 
 #[test]
+fn top_level_help_documents_query_edit_and_review_workflow() {
+    Command::cargo_bin("bib")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("INPUT OBJECT")
+                .and(predicate::str::contains("QUERY EXAMPLES"))
+                .and(predicate::str::contains("EDITING"))
+                .and(predicate::str::contains("INTEGRITY"))
+                .and(predicate::str::contains("EXIT STATUS"))
+                .and(predicate::str::contains(".fields.year = \"2026\""))
+                .and(predicate::str::contains(
+                    "bib integrity add updated.bib --key paper1 --in-place",
+                )),
+        );
+}
+
+#[test]
 fn query_supports_jq_filters_and_raw_output() {
     Command::cargo_bin("bib")
         .unwrap()
