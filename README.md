@@ -1,7 +1,9 @@
 # bib
 
-`bib` is a Rust CLI for querying BibTeX with jq filters and attaching
-reviewable integrity markers to approved entries.
+`bib` is a Rust CLI for reconciling BibTeX with literature metadata providers,
+querying entries with jq filters, and attaching reviewable integrity markers to
+approved records. It uses a provider-neutral literature model; Crossref is the
+default backend.
 
 It is designed for a workflow where an agent edits or researches bibliography
 entries, a human reviews the result, and the agent marks only the confirmed
@@ -25,13 +27,13 @@ Choose another directory or a specific release with environment variables:
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
-  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.1.0 sh
+  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.2.0 sh
 ```
 
 Export the variables first when that reads more clearly:
 
 ```sh
-export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.1.0
+export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.2.0
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
 ```
@@ -64,6 +66,34 @@ cargo run -- -r '.[].id' references.bib
 ```
 
 ## Quick start
+
+Plan metadata replacements for selected entries:
+
+```sh
+bib source plan references.bib --key watson1953
+```
+
+Entries with a DOI receive an exact provider lookup. Entries without one return
+ranked candidates for review. After choosing an exact provider record, apply it
+without disturbing comments, string declarations, citation keys, or local-only
+fields:
+
+```sh
+bib source apply references.bib \
+  --key watson1953 \
+  --id 10.1038/171737a0 \
+  --in-place
+```
+
+The updated entry receives provider-neutral provenance fields:
+
+```bibtex
+bibprovider = {crossref},
+bibproviderid = {10.1038/171737a0}
+```
+
+Inspect the changes before recording human approval. Provider provenance and
+human verification are deliberately separate states.
 
 Inspect the review status of every entry:
 
@@ -135,13 +165,70 @@ input file.
 | --- | --- |
 | `bib FILTER [FILE ...]` | Run a jq filter and emit JSON |
 | `bib --bibtex FILTER [FILE ...]` | Emit filtered entry objects as BibTeX |
+| `bib source providers` | List installed metadata providers |
+| `bib source search QUERY` | Search a provider and return ranked common records |
+| `bib source plan FILE --key KEY` | Produce candidates and field-level diffs |
+| `bib source apply FILE --key KEY [--id ID]` | Apply one exact provider record |
 | `bib integrity status FILE [--json]` | Report `verified`, `stale`, or `unverified` |
 | `bib integrity hash FILE KEY` | Print the expected SHA-256 value |
 | `bib integrity add FILE --key KEY [--in-place]` | Add or refresh approved entries |
 | `bib integrity remove FILE --key KEY [--in-place]` | Remove approval markers |
 
-Run `bib --help`, `bib integrity --help`, or a specific subcommand's `--help`
-for the complete option list.
+Run `bib --help`, `bib source --help`, `bib integrity --help`, or a specific
+subcommand's `--help` for the complete option list.
+
+## Literature providers
+
+All backends implement the same operations over a common literature record:
+
+- exact lookup by the provider's stable record identifier;
+- ranked bibliographic search;
+- mapping authorship, title, container, publication date, identifiers, and
+  publication details into provider-neutral fields;
+- projection of that record into BibTeX plus `bibprovider` and `bibproviderid`.
+
+Crossref is currently installed and selected by default. Use `--provider NAME`
+to select another installed backend; `bib source providers` lists the registry.
+The command structure and saved provenance do not depend on Crossref-specific
+field names.
+
+Set an email address for providers that support polite API identification:
+
+```sh
+export BIB_MAILTO=researcher@example.org
+```
+
+### Agent review workflow
+
+For entries with an existing DOI or stored provider identifier:
+
+```sh
+bib source plan references.bib --key paper1
+bib source apply references.bib --key paper1 --in-place
+```
+
+For entries without an exact identifier, `plan` returns up to five ranked
+candidates and exits with status `3`. An agent should compare title, authors,
+year, venue, record type, and the proposed field diff with the cited work. It
+must not silently choose the highest provider score. Apply only an explicitly
+selected candidate:
+
+```sh
+bib source apply references.bib \
+  --key paper1 --id 10.1234/chosen-record --in-place
+```
+
+`apply` only updates fields supplied by the provider. It retains fields absent
+from the provider record, including local fields such as `file`, `keywords`,
+and annotations. It does not add or refresh integrity. After human review:
+
+```sh
+bib integrity add references.bib --key paper1 --in-place
+```
+
+Use `--all` with `source plan` to generate a review packet for the complete
+bibliography. Applying records remains intentionally key-by-key so candidate
+selection stays explicit.
 
 ## Review workflow
 

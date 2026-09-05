@@ -1,4 +1,7 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -29,6 +32,7 @@ fn top_level_help_documents_query_edit_and_review_workflow() {
             predicate::str::contains("INPUT OBJECT")
                 .and(predicate::str::contains("QUERY EXAMPLES"))
                 .and(predicate::str::contains("EDITING"))
+                .and(predicate::str::contains("LITERATURE SOURCES"))
                 .and(predicate::str::contains("INTEGRITY"))
                 .and(predicate::str::contains("EXIT STATUS"))
                 .and(predicate::str::contains(".fields.year = \"2026\""))
@@ -36,6 +40,87 @@ fn top_level_help_documents_query_edit_and_review_workflow() {
                     "bib integrity add updated.bib --key paper1 --in-place",
                 )),
         );
+}
+
+#[test]
+fn source_help_explains_provider_and_review_workflow() {
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["source", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bib source plan refs.bib")
+                .and(predicate::str::contains("bibprovider = {name}"))
+                .and(predicate::str::contains("bib integrity add refs.bib")),
+        );
+}
+
+#[test]
+fn provider_apply_preserves_local_content_and_requires_later_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        r#"% retain me
+@string{venue = {Old Journal}}
+@article{paper1,
+  title = {Old title},
+  journal = venue,
+  file = {/local/paper.pdf},
+}
+"#,
+    )
+    .unwrap();
+    let base_url = mock_crossref(
+        r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Provider title"],"author":[{"given":"Jane","family":"Doe"}],"container-title":["Provider Journal"],"issued":{"date-parts":[[2026]]}}}"#,
+    );
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args(["--key", "paper1", "--id", "10.1234/example", "--in-place"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "review it before adding integrity",
+        ));
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(output.starts_with("% retain me\n@string{venue"));
+    assert!(output.contains("title = {Provider title}"));
+    assert!(output.contains("journal = {Provider Journal}"));
+    assert!(output.contains("file = {/local/paper.pdf}"));
+    assert!(output.contains("bibprovider = {crossref}"));
+    assert!(output.contains("bibproviderid = {10.1234/example}"));
+    assert!(!output.contains("integrity ="));
+}
+
+#[test]
+fn provider_apply_does_not_write_invalid_bibtex() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    let original = "@article{paper1, title={Original}}\n";
+    fs::write(&path, original).unwrap();
+    let base_url = mock_crossref(
+        r#"{"message":{"DOI":"10.1234/broken","type":"journal-article","title":["Unbalanced } title"]}}"#,
+    );
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args(["--key", "paper1", "--id", "10.1234/broken", "--in-place"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "provider update produced invalid BibTeX",
+        ));
+
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]
@@ -112,4 +197,22 @@ fn add_requires_an_explicit_review_selection() {
         .stderr(predicate::str::contains(
             "pass --key KEY or --all after review",
         ));
+}
+
+fn mock_crossref(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    format!("http://{address}/")
 }

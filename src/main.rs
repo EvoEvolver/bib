@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -6,13 +6,18 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use bib_cli::bibtex::{Record, parse};
-use bib_cli::integrity::{Status, atomic_write, hash, status, update_source};
+use bib_cli::catalog::{
+    BibliographicQuery, Candidate, FieldChange, LiteratureIdentifier, LiteratureRecord,
+    PROVIDER_FIELD, PROVIDER_ID_FIELD, changes,
+};
+use bib_cli::integrity::{Status, atomic_write, hash, status, update_entry_fields, update_source};
+use bib_cli::providers::{self, DEFAULT_PROVIDER};
 use bib_cli::query;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 
-const LONG_ABOUT: &str = "Query and transform BibTeX with jq-compatible filters, then add integrity markers to entries that have been explicitly reviewed. Query input is an array of entry objects; query results go to stdout and never overwrite input files.";
+const LONG_ABOUT: &str = "Reconcile BibTeX with pluggable literature metadata providers, query and transform entries with jq-compatible filters, then add integrity markers to records that have been explicitly reviewed. Crossref is the default provider. Query input is an array of entry objects; query results go to stdout and never overwrite input files.";
 
 const AFTER_HELP: &str = r#"INPUT OBJECT
   {
@@ -32,6 +37,20 @@ QUERY EXAMPLES
   Read stdin or combine multiple files into one input array:
     bib -r '.[].id' -
     bib -r '.[].id' first.bib second.bib
+
+LITERATURE SOURCES
+  Providers map their native metadata into one common literature record. Crossref is
+  the default backend; commands remain provider-neutral:
+    bib source plan refs.bib --key paper1
+    bib source apply refs.bib --key paper1 --in-place
+
+  An entry with a DOI is looked up exactly. Without a DOI, plan returns ranked
+  candidates and exits 3; inspect them and pass the chosen record id explicitly:
+    bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
+
+  Apply writes bibprovider and bibproviderid fields and preserves citation keys, comments,
+  string declarations, local fields, and fields absent from provider metadata. It
+  never adds integrity; review the diff and approve the entry separately.
 
 EDITING
   Filters can change entry objects. Use --bibtex to serialize them back to BibTeX:
@@ -53,14 +72,29 @@ INTEGRITY
 EXIT STATUS
   0  Success (or every selected entry is verified for 'integrity status')
   2  Invalid input, filter, or operational error
-  3  At least one selected entry is stale or unverified
+  3  Review or selection is needed, or integrity is stale/unverified
   With -e, query mode also follows jq result statuses: 1 for false/null, 4 for no result."#;
+
+const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
+  1. Plan replacements and inspect exact matches or ranked candidates:
+       bib source plan refs.bib --key paper1
+  2. For a DOI-backed exact match, apply it directly. For search results, pass the
+     chosen candidate id explicitly with --id:
+       bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
+  3. Review the resulting entry, then record human approval separately:
+       bib integrity add refs.bib --key paper1 --in-place
+
+PROVENANCE
+  Applied entries receive bibprovider = {name} and bibproviderid = {id}. These
+  record where normalized metadata came from and are separate from the integrity
+  marker. Crossref is the default provider. Set BIB_MAILTO or pass --mailto for
+  polite API identification."#;
 
 #[derive(Parser)]
 #[command(
     name = "bib",
     version,
-    about = "Query BibTeX like jq and mark human-reviewed entries",
+    about = "Reconcile, query, and verify BibTeX",
     long_about = LONG_ABOUT,
     after_help = AFTER_HELP,
     args_conflicts_with_subcommands = true
@@ -95,8 +129,80 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Find and apply records from a literature metadata provider.
+    Source(SourceArgs),
     /// Inspect, add, or remove integrity markers.
     Integrity(IntegrityArgs),
+}
+
+#[derive(Args)]
+#[command(after_help = SOURCE_AFTER_HELP)]
+struct SourceArgs {
+    #[command(subcommand)]
+    command: SourceCommand,
+}
+
+#[derive(Subcommand)]
+enum SourceCommand {
+    /// List installed literature metadata providers.
+    Providers,
+    /// Search a provider and return ranked records as JSON.
+    Search {
+        query: String,
+        /// Metadata provider name.
+        #[arg(long, default_value = DEFAULT_PROVIDER)]
+        provider: String,
+        /// Maximum candidate count.
+        #[arg(long, default_value_t = 5, value_parser = parse_limit)]
+        limit: usize,
+        /// Emit compact JSON.
+        #[arg(short, long)]
+        compact: bool,
+        /// Email sent to providers that support polite API identification.
+        #[arg(long, env = "BIB_MAILTO")]
+        mailto: Option<String>,
+    },
+    /// Plan provider replacements for explicitly selected BibTeX entries.
+    Plan {
+        file: PathBuf,
+        /// Citation key to inspect. Repeat for multiple entries.
+        #[arg(short, long)]
+        key: Vec<String>,
+        /// Inspect every entry.
+        #[arg(long, conflicts_with = "key")]
+        all: bool,
+        /// Metadata provider name. Defaults to stored provenance, then Crossref.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Maximum candidates for entries without a provider identifier.
+        #[arg(long, default_value_t = 5, value_parser = parse_limit)]
+        limit: usize,
+        /// Emit compact JSON.
+        #[arg(short, long)]
+        compact: bool,
+        /// Email sent to providers that support polite API identification.
+        #[arg(long, env = "BIB_MAILTO")]
+        mailto: Option<String>,
+    },
+    /// Apply one exact provider record to one BibTeX entry.
+    Apply {
+        file: PathBuf,
+        /// Citation key to update.
+        #[arg(short, long)]
+        key: String,
+        /// Exact provider record identifier. Uses stored provenance or DOI when omitted.
+        #[arg(long)]
+        id: Option<String>,
+        /// Metadata provider name. Defaults to stored provenance, then Crossref.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Atomically update FILE instead of writing the result to stdout.
+        #[arg(short, long)]
+        in_place: bool,
+        /// Email sent to providers that support polite API identification.
+        #[arg(long, env = "BIB_MAILTO")]
+        mailto: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -155,6 +261,25 @@ struct StatusRow<'a> {
     stored: Option<&'a str>,
 }
 
+#[derive(Serialize)]
+struct PlannedCandidate {
+    score: Option<f64>,
+    record: LiteratureRecord,
+    changes: Vec<FieldChange>,
+}
+
+#[derive(Serialize)]
+struct PlanRow {
+    id: String,
+    provider: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    candidates: Vec<PlannedCandidate>,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => ExitCode::from(code),
@@ -168,6 +293,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     if let Some(command) = cli.command {
         return match command {
+            Command::Source(args) => run_source(args.command),
             Command::Integrity(args) => run_integrity(args.command),
         };
     }
@@ -185,6 +311,233 @@ fn run(cli: Cli) -> Result<u8> {
     } else {
         Ok(0)
     }
+}
+
+fn run_source(command: SourceCommand) -> Result<u8> {
+    match command {
+        SourceCommand::Providers => {
+            for name in providers::names() {
+                println!(
+                    "{name}{}",
+                    if *name == DEFAULT_PROVIDER {
+                        "\tdefault"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(0)
+        }
+        SourceCommand::Search {
+            query,
+            provider,
+            limit,
+            compact,
+            mailto,
+        } => {
+            let backend = providers::open(&provider, mailto.as_deref())?;
+            let candidates = backend.search(&BibliographicQuery { citation: query }, limit)?;
+            print_serializable(&candidates, compact)?;
+            Ok(if candidates.is_empty() { 3 } else { 0 })
+        }
+        SourceCommand::Plan {
+            file,
+            key,
+            all,
+            provider,
+            limit,
+            compact,
+            mailto,
+        } => {
+            let source = read_file(&file)?;
+            let records = parse(&source)?;
+            let selected = select_records(&records, key, all)?;
+            let mut rows = Vec::new();
+            let mut needs_review = false;
+            let mut backends = BTreeMap::new();
+            for record in selected {
+                let (provider_name, stored_id) = source_identity(record, provider.as_deref());
+                if !backends.contains_key(&provider_name) {
+                    match providers::open(&provider_name, mailto.as_deref()) {
+                        Ok(backend) => {
+                            backends.insert(provider_name.clone(), backend);
+                        }
+                        Err(error) => {
+                            needs_review = true;
+                            rows.push(PlanRow {
+                                id: record.entry_key.clone(),
+                                provider: provider_name.clone(),
+                                status: "error",
+                                query: None,
+                                error: Some(format!("{error:#}")),
+                                candidates: vec![],
+                            });
+                            continue;
+                        }
+                    }
+                }
+                let Some(backend) = backends.get(&provider_name) else {
+                    unreachable!("provider was inserted above")
+                };
+                let identifier = stored_id.map(LiteratureIdentifier::ProviderId).or_else(|| {
+                    record
+                        .fields
+                        .get("doi")
+                        .cloned()
+                        .map(LiteratureIdentifier::Doi)
+                });
+                if let Some(identifier) = identifier {
+                    match backend.lookup(&identifier) {
+                        Ok(candidate) => rows.push(PlanRow {
+                            id: record.entry_key.clone(),
+                            provider: provider_name.clone(),
+                            status: "exact",
+                            query: None,
+                            error: None,
+                            candidates: vec![planned_candidate(
+                                record,
+                                Candidate {
+                                    score: None,
+                                    record: candidate,
+                                },
+                            )],
+                        }),
+                        Err(error) => {
+                            needs_review = true;
+                            rows.push(PlanRow {
+                                id: record.entry_key.clone(),
+                                provider: provider_name.clone(),
+                                status: "error",
+                                query: None,
+                                error: Some(format!("{error:#}")),
+                                candidates: vec![],
+                            });
+                        }
+                    }
+                } else {
+                    needs_review = true;
+                    let query = BibliographicQuery::from_record(record);
+                    match backend.search(&query, limit) {
+                        Ok(candidates) => rows.push(PlanRow {
+                            id: record.entry_key.clone(),
+                            provider: provider_name.clone(),
+                            status: "needs-selection",
+                            query: Some(query.citation),
+                            error: None,
+                            candidates: candidates
+                                .into_iter()
+                                .map(|candidate| planned_candidate(record, candidate))
+                                .collect(),
+                        }),
+                        Err(error) => rows.push(PlanRow {
+                            id: record.entry_key.clone(),
+                            provider: provider_name.clone(),
+                            status: "error",
+                            query: Some(query.citation),
+                            error: Some(format!("{error:#}")),
+                            candidates: vec![],
+                        }),
+                    }
+                }
+            }
+            print_serializable(&rows, compact)?;
+            Ok(if needs_review { 3 } else { 0 })
+        }
+        SourceCommand::Apply {
+            file,
+            key,
+            id,
+            provider,
+            in_place,
+            mailto,
+        } => {
+            let source = read_file(&file)?;
+            let records = parse(&source)?;
+            let record = records
+                .iter()
+                .find(|record| record.entry_key == key)
+                .with_context(|| format!("citation key not found: {key}"))?;
+            let (provider_name, stored_id) = source_identity(record, provider.as_deref());
+            let identifier = id
+                .map(LiteratureIdentifier::ProviderId)
+                .or_else(|| stored_id.map(LiteratureIdentifier::ProviderId))
+                .or_else(|| {
+                    record
+                        .fields
+                        .get("doi")
+                        .cloned()
+                        .map(LiteratureIdentifier::Doi)
+                })
+                .context("no exact provider id; pass --id after selecting a search candidate")?;
+            let backend = providers::open(&provider_name, mailto.as_deref())?;
+            let provider_record = backend.lookup(&identifier)?;
+            let fields = provider_record.bibtex_fields();
+            let output =
+                update_entry_fields(&source, &key, provider_record.bibtex_type(), &fields)?;
+            parse(&output)
+                .context("provider update produced invalid BibTeX; file was not changed")?;
+            if in_place {
+                atomic_write(&file, &output)?;
+                eprintln!(
+                    "updated {key} from {provider_name}:{} in {}; review it before adding integrity",
+                    provider_record.id,
+                    file.display()
+                );
+            } else {
+                print!("{output}");
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn planned_candidate(record: &Record, candidate: Candidate) -> PlannedCandidate {
+    PlannedCandidate {
+        score: candidate.score,
+        changes: changes(record, &candidate.record),
+        record: candidate.record,
+    }
+}
+
+fn source_identity(record: &Record, requested: Option<&str>) -> (String, Option<String>) {
+    let stored = record
+        .fields
+        .get(PROVIDER_FIELD)
+        .zip(record.fields.get(PROVIDER_ID_FIELD))
+        .map(|(provider, id)| (provider.as_str(), id.as_str()));
+    match requested {
+        Some(provider) => (
+            provider.to_owned(),
+            stored
+                .and_then(|(stored_provider, id)| (stored_provider == provider).then_some(id))
+                .map(str::to_owned),
+        ),
+        None => stored.map_or_else(
+            || (DEFAULT_PROVIDER.to_owned(), None),
+            |(provider, id)| (provider.to_owned(), Some(id.to_owned())),
+        ),
+    }
+}
+
+fn select_records(records: &[Record], keys: Vec<String>, all: bool) -> Result<Vec<&Record>> {
+    let selected: BTreeSet<_> = keys.into_iter().collect();
+    if !all && selected.is_empty() {
+        bail!("no entries selected; pass --key KEY or --all");
+    }
+    ensure_keys_exist(records, &selected)?;
+    Ok(records
+        .iter()
+        .filter(|record| all || selected.contains(&record.entry_key))
+        .collect())
+}
+
+fn print_serializable(value: &impl Serialize, compact: bool) -> Result<()> {
+    if compact {
+        println!("{}", serde_json::to_string(value)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
 }
 
 fn run_integrity(command: IntegrityCommand) -> Result<u8> {
@@ -349,4 +702,14 @@ fn jq_exit_status(last: Option<&Value>) -> u8 {
         Some(_) => 0,
         None => 4,
     }
+}
+
+fn parse_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 to 20".to_owned())?;
+    (1..=20)
+        .contains(&limit)
+        .then_some(limit)
+        .ok_or_else(|| "limit must be an integer from 1 to 20".to_owned())
 }

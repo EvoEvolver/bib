@@ -143,6 +143,8 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 #[derive(Debug)]
 struct EntrySpan {
     key: String,
+    type_start: usize,
+    type_end: usize,
     open: usize,
     close: usize,
     fields: Vec<FieldSpan>,
@@ -163,6 +165,63 @@ struct Edit {
     replacement: String,
 }
 
+pub fn update_entry_fields(
+    source: &str,
+    key: &str,
+    entry_type: &str,
+    fields: &BTreeMap<String, String>,
+) -> Result<String> {
+    let spans = scan_entries(source)?;
+    let entry = spans
+        .iter()
+        .find(|entry| entry.key == key)
+        .with_context(|| format!("citation key not found: {key}"))?;
+    let mut edits = Vec::new();
+
+    let current_type = &source[entry.type_start..entry.type_end];
+    if !current_type.eq_ignore_ascii_case(entry_type) {
+        edits.push(Edit {
+            start: entry.type_start,
+            end: entry.type_end,
+            replacement: entry_type.to_owned(),
+        });
+    }
+
+    let mut missing = Vec::new();
+    for (name, value) in fields {
+        let matching: Vec<_> = entry
+            .fields
+            .iter()
+            .filter(|field| field.name.eq_ignore_ascii_case(name))
+            .collect();
+        if matching.len() > 1 {
+            bail!("entry {key} has multiple {name} fields");
+        }
+        let replacement = format!("{name} = {{{value}}}");
+        if let Some(field) = matching.first() {
+            if source[field.trimmed_start..field.trimmed_end] != replacement {
+                edits.push(Edit {
+                    start: field.trimmed_start,
+                    end: field.trimmed_end,
+                    replacement,
+                });
+            }
+        } else {
+            missing.push(replacement);
+        }
+    }
+
+    if !missing.is_empty() {
+        edits.push(insertion_edit(source, entry, missing.join(",\n")));
+    }
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
+    let mut output = source.to_owned();
+    for edit in edits {
+        output.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    Ok(output)
+}
+
 fn insertion_edit(source: &str, entry: &EntrySpan, value: String) -> Edit {
     let bytes = source.as_bytes();
     let mut body_end = entry.close;
@@ -176,6 +235,7 @@ fn insertion_edit(source: &str, entry: &EntrySpan, value: String) -> Edit {
         .and_then(|field| line_indent(source, field.trimmed_start))
         .unwrap_or("  ");
     let prefix = if has_trailing_comma { "" } else { "," };
+    let value = value.replace('\n', &format!("\n{indent}"));
     Edit {
         start: body_end,
         end: body_end,
@@ -234,6 +294,8 @@ fn scan_entries(source: &str) -> Result<Vec<EntrySpan>> {
         let fields = scan_fields(source, comma + 1, close)?;
         entries.push(EntrySpan {
             key,
+            type_start,
+            type_end: cursor,
             open,
             close,
             fields,
@@ -417,5 +479,19 @@ mod tests {
             status(&parse(&added).unwrap()[0]).unwrap(),
             Status::Verified
         );
+    }
+
+    #[test]
+    fn updating_fields_preserves_local_source_structure() {
+        let fields = BTreeMap::from([
+            ("title".to_owned(), "Replacement".to_owned()),
+            ("doi".to_owned(), "10.1/example".to_owned()),
+        ]);
+        let output = update_entry_fields(SAMPLE, "One", "article", &fields).unwrap();
+        assert!(output.starts_with("% keep this comment\n@string{conf"));
+        assert!(output.contains("journal = conf"));
+        assert!(output.contains("title = {Replacement}"));
+        assert!(output.contains("doi = {10.1/example}"));
+        assert!(output.contains("@misc(Two"));
     }
 }

@@ -1,0 +1,262 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::bibtex::Record;
+
+pub const PROVIDER_FIELD: &str = "bibprovider";
+pub const PROVIDER_ID_FIELD: &str = "bibproviderid";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiteratureIdentifier {
+    ProviderId(String),
+    Doi(String),
+}
+
+impl LiteratureIdentifier {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::ProviderId(value) | Self::Doi(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Contributor {
+    pub family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub given: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orcid: Option<String>,
+}
+
+impl Contributor {
+    fn to_bibtex(&self) -> String {
+        match self.given.as_deref().filter(|value| !value.is_empty()) {
+            Some(given) if self.family.is_empty() => given.to_owned(),
+            Some(given) => format!("{}, {}", self.family, given),
+            None => self.family.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PublicationDate {
+    pub year: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub month: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub day: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LiteratureRecord {
+    pub provider: String,
+    pub id: String,
+    pub record_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<Contributor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editors: Vec<Contributor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued: Option<PublicationDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub article_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub isbn: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issn: Vec<String>,
+}
+
+impl LiteratureRecord {
+    pub fn bibtex_type(&self) -> &'static str {
+        match self.record_type.as_str() {
+            "journal-article" => "article",
+            "proceedings-article" => "inproceedings",
+            "book-chapter" | "reference-entry" => "incollection",
+            "book" | "edited-book" | "monograph" | "reference-book" => "book",
+            "dissertation" => "phdthesis",
+            "report" => "techreport",
+            _ => "misc",
+        }
+    }
+
+    pub fn bibtex_fields(&self) -> BTreeMap<String, String> {
+        let mut fields = BTreeMap::new();
+        insert_option(&mut fields, "title", self.title.clone());
+        if !self.authors.is_empty() {
+            fields.insert(
+                "author".into(),
+                self.authors
+                    .iter()
+                    .map(Contributor::to_bibtex)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+            );
+        }
+        if !self.editors.is_empty() {
+            fields.insert(
+                "editor".into(),
+                self.editors
+                    .iter()
+                    .map(Contributor::to_bibtex)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+            );
+        }
+        let container_field = match self.bibtex_type() {
+            "article" => Some("journal"),
+            "inproceedings" | "incollection" => Some("booktitle"),
+            _ => None,
+        };
+        if let Some(field) = container_field {
+            insert_option(&mut fields, field, self.container_title.clone());
+        }
+        insert_option(&mut fields, "publisher", self.publisher.clone());
+        if let Some(date) = &self.issued {
+            fields.insert("year".into(), date.year.to_string());
+            if let Some(month) = date.month {
+                fields.insert("month".into(), month.to_string());
+            }
+        }
+        insert_option(&mut fields, "volume", self.volume.clone());
+        insert_option(&mut fields, "number", self.issue.clone());
+        insert_option(&mut fields, "pages", self.pages.clone());
+        insert_option(&mut fields, "eid", self.article_number.clone());
+        insert_option(&mut fields, "doi", self.doi.clone());
+        insert_option(&mut fields, "url", self.url.clone());
+        if let Some(isbn) = self.isbn.first() {
+            fields.insert("isbn".into(), isbn.clone());
+        }
+        if let Some(issn) = self.issn.first() {
+            fields.insert("issn".into(), issn.clone());
+        }
+        fields.insert(PROVIDER_FIELD.into(), self.provider.clone());
+        fields.insert(PROVIDER_ID_FIELD.into(), self.id.clone());
+        fields
+    }
+}
+
+fn insert_option(fields: &mut BTreeMap<String, String>, name: &str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        fields.insert(name.to_owned(), value);
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Candidate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    pub record: LiteratureRecord,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BibliographicQuery {
+    pub citation: String,
+}
+
+impl BibliographicQuery {
+    pub fn from_record(record: &Record) -> Self {
+        let fields = &record.fields;
+        let citation = [
+            fields.get("author"),
+            fields.get("title"),
+            fields.get("journal").or_else(|| fields.get("booktitle")),
+            fields.get("year"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(". ");
+        Self { citation }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FieldChange {
+    pub field: String,
+    pub current: Option<String>,
+    pub proposed: String,
+}
+
+pub fn changes(current: &Record, proposed: &LiteratureRecord) -> Vec<FieldChange> {
+    let mut output = Vec::new();
+    if !current
+        .entry_type
+        .eq_ignore_ascii_case(proposed.bibtex_type())
+    {
+        output.push(FieldChange {
+            field: "ENTRYTYPE".into(),
+            current: Some(current.entry_type.clone()),
+            proposed: proposed.bibtex_type().into(),
+        });
+    }
+    for (field, value) in proposed.bibtex_fields() {
+        if current.fields.get(&field) != Some(&value) {
+            output.push(FieldChange {
+                field: field.clone(),
+                current: current.fields.get(&field).cloned(),
+                proposed: value,
+            });
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_provider_neutral_bibtex_fields() {
+        let record = LiteratureRecord {
+            provider: "test".into(),
+            id: "work-1".into(),
+            record_type: "journal-article".into(),
+            title: Some("A result".into()),
+            authors: vec![Contributor {
+                family: "Doe".into(),
+                given: Some("Jane".into()),
+                orcid: None,
+            }],
+            editors: vec![],
+            container_title: Some("A Journal".into()),
+            publisher: None,
+            issued: Some(PublicationDate {
+                year: 2026,
+                month: None,
+                day: None,
+            }),
+            volume: None,
+            issue: None,
+            pages: None,
+            article_number: None,
+            doi: Some("10.1/example".into()),
+            url: None,
+            isbn: vec![],
+            issn: vec![],
+        };
+        let fields = record.bibtex_fields();
+        assert_eq!(fields["author"], "Doe, Jane");
+        assert_eq!(fields["journal"], "A Journal");
+        assert_eq!(fields[PROVIDER_FIELD], "test");
+        assert_eq!(fields[PROVIDER_ID_FIELD], "work-1");
+    }
+}
