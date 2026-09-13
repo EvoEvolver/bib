@@ -1,9 +1,9 @@
 # bib
 
 `bib` is a Rust CLI for reconciling BibTeX with literature metadata providers,
-querying entries with jq filters, and attaching source-bound integrity markers.
-Every integrity marker references a separate `@bibsource` provenance entry.
-Crossref is the default metadata backend; DOI content negotiation is also built in.
+inspecting entries as JSON, and attaching source-bound integrity markers. Every
+integrity marker references a separate `@bibsource` provenance entry. Crossref is
+the default metadata backend; DOI content negotiation is also built in.
 
 It is designed for a workflow where an agent edits or researches bibliography
 entries, a human reviews the result, and the agent marks only confirmed citation
@@ -28,13 +28,13 @@ Choose another directory or a specific release with environment variables:
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
-  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.3.0 sh
+  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.4.0 sh
 ```
 
 Export the variables first when that reads more clearly:
 
 ```sh
-export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.3.0
+export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.4.0
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
 ```
@@ -45,8 +45,9 @@ Verify the installation:
 bib --version
 ```
 
-`bib` is self-contained after installation. It does not require Rust, Python,
-or `jq`.
+`bib` is self-contained after installation and does not require Rust or Python.
+`jq` is optional: use it as a separate process when a pipeline needs JSON
+selection or transformation.
 
 ## Quick start
 
@@ -104,7 +105,8 @@ bib integrity status references.bib
 List just the citation keys that need attention:
 
 ```sh
-bib -r '.[] | select(.integrity.status != "verified") | .id' references.bib
+bib inspect references.bib --json |
+  jq -r '.[] | select(.integrity.status != "verified") | .id'
 ```
 
 When metadata was supplied by an agent rather than an API, say so explicitly:
@@ -118,9 +120,10 @@ This creates `@bibsource{..., kind={agent}, actor={claude-code}, ...}`. A later
 content change makes integrity `stale`; missing, damaged, or inconsistent source
 evidence makes it `invalid`.
 
-## Query like jq
+## Inspect and pipe
 
-The query input is an array. Each entry has this shape:
+`bib inspect` emits one JSON array. `--json` may be included to make that contract
+explicit in agent scripts. Each entry has this shape:
 
 ```json
 {
@@ -145,40 +148,42 @@ The query input is an array. Each entry has this shape:
 }
 ```
 
-Use normal jq syntax. `bib` embeds the Rust `jaq` engine, so a separate `jq`
-installation is not required.
+`bib` does not embed jq or evaluate filters. Pipe its stable JSON output to `jq`,
+another JSON processor, or an agent harness:
 
 ```sh
 # List entries that still need review.
-bib -r '.[] | select(.integrity.status != "verified") | .id' references.bib
+bib inspect references.bib |
+  jq -r '.[] | select(.integrity.status != "verified") | .id'
 
 # Give an agent a compact review packet.
-bib -c '[.[] | select(.integrity.status != "verified") |
-  {id, type, title: .fields.title, doi: .fields.doi}]' references.bib
+bib inspect references.bib --compact |
+  jq -c '[.[] | select(.integrity.status != "verified") |
+    {id, type, title: .fields.title, doi: .fields.doi}]'
 
-# Select entries and emit BibTeX again.
-bib --bibtex 'map(select(.fields.year == "2026"))' references.bib
+# Select entries and feed their keys to a controlled write command.
+bib inspect references.bib |
+  jq -r '.[] | select(.fields.year == "2026") | .id' |
+  bib integrity add references.bib --keys-from - \
+    --source agent --agent claude-code --in-place
 
 # Read BibTeX from stdin.
-cat references.bib | bib -r '.[].fields.doi // empty'
+cat references.bib | bib inspect - | jq -r '.[].fields.doi // empty'
 ```
 
-The familiar jq flags `-c` (compact), `-r` (raw strings), and `-e` (result-based
-exit status) are supported. Multiple files are combined into one input array.
-Use `-` as a filename to read that input from stdin. Querying never modifies an
-input file.
+Multiple files are combined into one array. Use `-` as a filename, or omit files,
+to read BibTeX from stdin. `inspect` never modifies input and omits `@bibsource`
+evidence entries from the array.
 
-`--bibtex` treats `integrity`, `bibsource`, `bibprovider`, and `bibproviderid` as
-reserved trust fields and removes them from serialized filter results. An agent
-cannot create or carry an integrity claim through a jq assignment; use
-`bib source apply` and `bib integrity add` to create provenance again after edits.
+There is intentionally no JSON-to-BibTeX conversion or arbitrary metadata editor.
+Edit bibliography data with the appropriate editor or domain tool. Only
+`bib source apply` and `bib integrity` write trusted workflow fields.
 
 ## Command reference
 
 | Command | Purpose |
 | --- | --- |
-| `bib FILTER [FILE ...]` | Run a jq filter and emit JSON |
-| `bib --bibtex FILTER [FILE ...]` | Emit filtered entry objects as BibTeX |
+| `bib inspect [FILE ...]` | Emit bibliography entries and trust state as JSON |
 | `bib source providers` | List installed metadata providers |
 | `bib source search QUERY` | Search a provider and return ranked common records |
 | `bib source plan FILE --key KEY` | Produce candidates and field-level diffs |
@@ -188,6 +193,7 @@ cannot create or carry an integrity claim through a jq assignment; use
 | `bib integrity status FILE [--json]` | Report `verified`, `stale`, `unverified`, or `invalid` |
 | `bib integrity hash FILE KEY` | Print the expected SHA-256 value |
 | `bib integrity add FILE --key KEY --source SOURCE` | Add attributed or provider-backed integrity |
+| `bib integrity add FILE --keys-from - --source SOURCE` | Add integrity for newline-delimited keys from a pipeline |
 | `bib integrity remove FILE --key KEY [--in-place]` | Remove approval markers |
 
 Run `bib --help`, `bib source --help`, `bib integrity --help`, or a specific
@@ -260,20 +266,30 @@ selection stays explicit.
 
 ## Review workflow
 
-1. Find entries without a valid marker:
+1. Find entries without a valid marker and create a review packet:
 
    ```sh
-   bib -c '[.[] | select(.integrity.status != "verified")]' references.bib
+   bib inspect references.bib |
+     jq '[.[] | select(.integrity.status != "verified")]'
    ```
 
 2. Let the agent fix the selected entries and show the changes to the human.
 
 3. After explicit confirmation, mark only the approved citation keys and identify
-   who supplied the assertion:
+   who supplied the assertion. Keys can be passed directly:
 
    ```sh
    bib integrity add references.bib --key turing1936 --key shannon1948 \
      --source human --reviewer alice --in-place
+   ```
+
+   Or streamed one per line from a selection pipeline:
+
+   ```sh
+   bib inspect references.bib |
+     jq -r '.[] | select(.integrity.status == "unverified") | .id' |
+     bib integrity add references.bib --keys-from - \
+       --source human --reviewer alice --in-place
    ```
 
 4. Check the complete file:
@@ -293,9 +309,10 @@ Without `--in-place`, `add` and `remove` write the updated BibTeX to stdout.
 Writes with `--in-place` use an atomic replacement and retain comments,
 `@string` declarations, and unrelated formatting.
 
-Neither command chooses entries implicitly: pass one or more `--key` options or
-the explicit `--all` option. This keeps an agent from marking unrelated entries
-during a partial review.
+Neither command chooses entries implicitly: pass one or more `--key` options,
+`--keys-from FILE`, or the explicit `--all` option. `--keys-from -` reads
+newline-delimited citation keys from stdin and rejects an empty selection. This
+keeps an agent from marking unrelated entries during a partial review.
 
 Other integrity commands:
 

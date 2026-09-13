@@ -10,40 +10,28 @@ use bib_cli::catalog::{
     BibliographicQuery, Candidate, FieldChange, LiteratureIdentifier, LiteratureRecord,
     PROVIDER_FIELD, PROVIDER_ID_FIELD, changes,
 };
+use bib_cli::inspect;
 use bib_cli::integrity::{
     Status, atomic_write, hash, status, update_entry_fields, update_entry_fields_exact,
     update_source,
 };
 use bib_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SourceKind};
 use bib_cli::providers::{self, DEFAULT_PROVIDER};
-use bib_cli::query;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use serde_json::Value;
 
-const LONG_ABOUT: &str = "Reconcile BibTeX with pluggable literature metadata providers, preserve raw API evidence, query and transform entries with jq-compatible filters, then add source-bound integrity markers. Every integrity marker must reference a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
+const LONG_ABOUT: &str = "Reconcile BibTeX with pluggable literature metadata providers, preserve raw API evidence, inspect entries as JSON, and add source-bound integrity markers. Every integrity marker must reference a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
 
-const AFTER_HELP: &str = r#"INPUT OBJECT
-  {
-    "id": "paper1",
-    "type": "article",
-    "fields": {"title": "A Paper", "year": "2026"},
-    "integrity": {
-      "status": "unverified", "expected": "...", "stored": null,
-      "source": {"key": null, "kind": null, "valid": false, "error": "..."}
-    }
-  }
+const AFTER_HELP: &str = r#"INSPECT AND PIPE
+  Emit bibliography entries and integrity state as one JSON array:
+    bib inspect refs.bib
 
-QUERY EXAMPLES
-  List citation keys that need review:
-    bib -r '.[] | select(.integrity.status != "verified") | .id' refs.bib
+  Use an external JSON processor when selection or transformation is useful:
+    bib inspect refs.bib | jq -r '.[] | select(.integrity.status != "verified") | .id'
 
-  Build a compact review packet:
-    bib -c '[.[] | {id, title: .fields.title, status: .integrity.status}]' refs.bib
-
-  Read stdin or combine multiple files into one input array:
-    bib -r '.[].id' -
-    bib -r '.[].id' first.bib second.bib
+  Feed selected citation keys back to a controlled write command:
+    bib inspect refs.bib | jq -r '.[].id' |
+      bib integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place
 
 LITERATURE SOURCES
   Providers map their native metadata into one common literature record. Crossref is
@@ -63,15 +51,10 @@ LITERATURE SOURCES
   Use --provider doi for DOI content negotiation (raw application/x-bibtex) or
   --provider crossref for the Crossref works API (raw JSON).
 
-EDITING
-  Filters can change entry objects. Use --bibtex to serialize them back to BibTeX:
-    bib --bibtex 'map(if .id == "paper1" then .fields.year = "2026" else . end)' refs.bib > updated.bib
-
-  Query mode writes only to stdout. --bibtex strips integrity, bibsource,
-  bibprovider, and bibproviderid so filters cannot forge trust metadata. After
-  replacing a file, review the result, then approve explicit keys:
-    bib integrity status updated.bib
-    bib integrity add updated.bib --key paper1 --source agent --agent MODEL --in-place
+SCOPE
+  bib deliberately does not provide arbitrary metadata editing or an embedded jq
+  implementation. Use normal editors, domain tools, and shell pipelines for data
+  processing. Only source and integrity commands write trusted workflow fields.
 
 INTEGRITY
   verified    Stored integrity matches the current covered fields.
@@ -80,17 +63,33 @@ INTEGRITY
   invalid     The marker matches, but provenance is missing, damaged, or inconsistent.
 
   Adding integrity always requires --source provider, --source agent --agent ID,
-  or --source human --reviewer ID, plus one or more --key options or --all.
+  or --source human --reviewer ID, plus --key, --keys-from, or --all.
 
 EXIT STATUS
   0  Success (or every selected entry is verified for 'integrity status')
-  2  Invalid input, filter, or operational error
-  3  Review or selection is needed, or integrity is stale/unverified
-  With -e, query mode also follows jq result statuses: 1 for false/null, 4 for no result."#;
+  2  Invalid input or operational error
+  3  Review or selection is needed, or integrity is stale/unverified."#;
+
+const INSPECT_AFTER_HELP: &str = r#"OUTPUT
+  inspect writes one JSON array containing only bibliography entries. @bibsource
+  evidence entries are omitted, but each bibliography entry includes a summary of
+  its integrity and provenance state.
+
+PIPELINE EXAMPLES
+  bib inspect refs.bib | jq -r '.[].id'
+  bib inspect refs.bib --compact |
+    jq -r '.[] | select(.integrity.status != "verified") | .id'
+  cat refs.bib | bib inspect -
+
+jq is optional and external. bib itself does not evaluate filters or turn edited
+JSON back into BibTeX."#;
 
 const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
   1. Plan replacements and inspect exact matches or ranked candidates:
        bib source plan refs.bib --key paper1
+     Multiple keys may come from a newline-delimited pipeline:
+       bib inspect refs.bib | jq -r '.[].id' |
+         bib source plan refs.bib --keys-from -
   2. For a DOI-backed exact match, apply it directly. For search results, pass the
      chosen candidate id explicitly with --id:
        bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
@@ -117,6 +116,8 @@ EXAMPLES
   bib integrity add refs.bib --key paper1 --source provider --in-place
   bib integrity add refs.bib --key draft1 --source agent --agent claude-code --in-place
   bib integrity add refs.bib --key paper1 --source human --reviewer alice --in-place
+  jq -r '.[].id' review.json | bib integrity add refs.bib --keys-from - \
+    --source human --reviewer alice --in-place
 
 Agent and human modes are attributed assertions, not cryptographic identities.
 Provider mode proves deterministic agreement with the stored response bytes; it
@@ -126,45 +127,36 @@ does not prove that a manually forged response was genuinely served by the API."
 #[command(
     name = "bib",
     version,
-    about = "Reconcile, query, and verify BibTeX",
+    about = "Reconcile, inspect, and verify BibTeX",
     long_about = LONG_ABOUT,
-    after_help = AFTER_HELP,
-    args_conflicts_with_subcommands = true
+    after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Emit compact JSON.
-    #[arg(short, long)]
-    compact_output: bool,
-
-    /// Emit strings without JSON quotes.
-    #[arg(short, long)]
-    raw_output: bool,
-
-    /// Set the exit status from the last filter result, like jq -e.
-    #[arg(short = 'e', long)]
-    exit_status: bool,
-
-    /// Render filtered entry objects as BibTeX instead of JSON.
-    #[arg(long)]
-    bibtex: bool,
-
     #[command(subcommand)]
-    command: Option<Command>,
-
-    /// A jq-compatible filter.
-    #[arg(default_value = ".")]
-    filter: String,
-
-    /// BibTeX files. Reads stdin when omitted or when FILE is `-`.
-    files: Vec<PathBuf>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Emit bibliography entries and their trust state as JSON.
+    Inspect(InspectArgs),
     /// Find and apply records from a literature metadata provider.
     Source(SourceArgs),
     /// Inspect, add, or remove integrity markers.
     Integrity(IntegrityArgs),
+}
+
+#[derive(Args)]
+#[command(after_help = INSPECT_AFTER_HELP)]
+struct InspectArgs {
+    /// BibTeX files. Reads stdin when omitted or when FILE is `-`.
+    files: Vec<PathBuf>,
+    /// Explicitly request JSON output (already the default).
+    #[arg(long)]
+    json: bool,
+    /// Emit the JSON array on one line.
+    #[arg(short, long)]
+    compact: bool,
 }
 
 #[derive(Args)]
@@ -200,8 +192,11 @@ enum SourceCommand {
         /// Citation key to inspect. Repeat for multiple entries.
         #[arg(short, long)]
         key: Vec<String>,
+        /// Read citation keys, one per line. Use `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        keys_from: Option<PathBuf>,
         /// Inspect every entry.
-        #[arg(long, conflicts_with = "key")]
+        #[arg(long, conflicts_with_all = ["key", "keys_from"])]
         all: bool,
         /// Metadata provider name. Defaults to stored provenance, then Crossref.
         #[arg(long)]
@@ -265,6 +260,9 @@ enum IntegrityCommand {
         /// Limit the report to these citation keys.
         #[arg(short, long)]
         key: Vec<String>,
+        /// Read citation keys, one per line. Use `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        keys_from: Option<PathBuf>,
     },
     /// Print the expected integrity hash for one entry.
     Hash { file: PathBuf, key: String },
@@ -274,8 +272,11 @@ enum IntegrityCommand {
         /// Citation key to approve. Repeat for multiple entries.
         #[arg(short, long)]
         key: Vec<String>,
+        /// Read citation keys, one per line. Use `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        keys_from: Option<PathBuf>,
         /// Approve every entry. This must be explicit.
-        #[arg(long, conflicts_with = "key")]
+        #[arg(long, conflicts_with_all = ["key", "keys_from"])]
         all: bool,
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
@@ -296,8 +297,11 @@ enum IntegrityCommand {
         /// Citation key to unapprove. Repeat for multiple entries.
         #[arg(short, long)]
         key: Vec<String>,
+        /// Read citation keys, one per line. Use `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        keys_from: Option<PathBuf>,
         /// Remove integrity from every entry.
-        #[arg(long, conflicts_with = "key")]
+        #[arg(long, conflicts_with_all = ["key", "keys_from"])]
         all: bool,
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
@@ -351,25 +355,19 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<u8> {
-    if let Some(command) = cli.command {
-        return match command {
-            Command::Source(args) => run_source(args.command),
-            Command::Integrity(args) => run_integrity(args.command),
-        };
-    }
-
-    let records = read_query_inputs(&cli.files)?;
-    let values = query::execute(&cli.filter, query::input(&records)?)?;
-    if cli.bibtex {
-        print!("{}", query::render_bibtex(&values)?);
-    } else {
-        print_json_values(&values, cli.compact_output, cli.raw_output)?;
-    }
-
-    if cli.exit_status {
-        Ok(jq_exit_status(values.last()))
-    } else {
-        Ok(0)
+    match cli.command {
+        Command::Inspect(args) => {
+            let InspectArgs {
+                files,
+                json: _,
+                compact,
+            } = args;
+            let records = read_bib_inputs(&files)?;
+            print_serializable(&inspect::document(&records)?, compact)?;
+            Ok(0)
+        }
+        Command::Source(args) => run_source(args.command),
+        Command::Integrity(args) => run_integrity(args.command),
     }
 }
 
@@ -403,6 +401,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
         SourceCommand::Plan {
             file,
             key,
+            keys_from,
             all,
             provider,
             limit,
@@ -411,7 +410,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
         } => {
             let source = read_file(&file)?;
             let records = parse(&source)?;
-            let selected = select_records(&records, key, all)?;
+            let selected = select_records(&records, merge_keys(key, keys_from)?, all)?;
             let mut rows = Vec::new();
             let mut needs_review = false;
             let mut backends = BTreeMap::new();
@@ -636,10 +635,15 @@ fn print_serializable(value: &impl Serialize, compact: bool) -> Result<()> {
 
 fn run_integrity(command: IntegrityCommand) -> Result<u8> {
     match command {
-        IntegrityCommand::Status { file, json, key } => {
+        IntegrityCommand::Status {
+            file,
+            json,
+            key,
+            keys_from,
+        } => {
             let source = read_file(&file)?;
             let records = parse(&source)?;
-            let selected: BTreeSet<_> = key.into_iter().collect();
+            let selected: BTreeSet<_> = merge_keys(key, keys_from)?.into_iter().collect();
             ensure_keys_exist(&records, &selected)?;
             let bibliography: Vec<_> = records
                 .iter()
@@ -692,18 +696,28 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
         IntegrityCommand::Add {
             file,
             key,
+            keys_from,
             all,
             in_place,
             source,
             agent,
             reviewer,
-        } => add_integrity(&file, key, all, in_place, source, agent, reviewer),
+        } => add_integrity(
+            &file,
+            merge_keys(key, keys_from)?,
+            all,
+            in_place,
+            source,
+            agent,
+            reviewer,
+        ),
         IntegrityCommand::Remove {
             file,
             key,
+            keys_from,
             all,
             in_place,
-        } => remove_integrity(&file, key, all, in_place),
+        } => remove_integrity(&file, merge_keys(key, keys_from)?, all, in_place),
     }
 }
 
@@ -828,14 +842,37 @@ fn ensure_keys_exist(records: &[Record], selected: &BTreeSet<String>) -> Result<
     Ok(())
 }
 
-fn read_query_inputs(files: &[PathBuf]) -> Result<Vec<Record>> {
+fn merge_keys(mut keys: Vec<String>, keys_from: Option<PathBuf>) -> Result<Vec<String>> {
+    let Some(path) = keys_from else {
+        return Ok(keys);
+    };
+    let source = if path == Path::new("-") {
+        read_stdin("citation keys")?
+    } else {
+        fs::read_to_string(&path)
+            .with_context(|| format!("could not read citation keys from {}", path.display()))?
+    };
+    keys.extend(
+        source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned),
+    );
+    if keys.is_empty() {
+        bail!("no citation keys found in {}", path.display());
+    }
+    Ok(keys)
+}
+
+fn read_bib_inputs(files: &[PathBuf]) -> Result<Vec<Record>> {
     if files.is_empty() {
-        return parse(&read_stdin()?);
+        return parse(&read_stdin("BibTeX")?);
     }
     let mut records = Vec::new();
     for file in files {
         let source = if file == Path::new("-") {
-            read_stdin()?
+            read_stdin("BibTeX")?
         } else {
             read_file(file)?
         };
@@ -848,40 +885,15 @@ fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))
 }
 
-fn read_stdin() -> Result<String> {
+fn read_stdin(description: &str) -> Result<String> {
     if io::stdin().is_terminal() {
-        bail!("no input: pass a .bib file or pipe BibTeX on stdin");
+        bail!("no {description} on stdin");
     }
     let mut source = String::new();
     io::stdin()
         .read_to_string(&mut source)
         .context("could not read stdin")?;
     Ok(source)
-}
-
-fn print_json_values(values: &[Value], compact: bool, raw: bool) -> Result<()> {
-    for value in values {
-        if raw {
-            match value {
-                Value::String(value) => println!("{value}"),
-                _ if compact => println!("{}", serde_json::to_string(value)?),
-                _ => println!("{}", serde_json::to_string_pretty(value)?),
-            }
-        } else if compact {
-            println!("{}", serde_json::to_string(value)?);
-        } else {
-            println!("{}", serde_json::to_string_pretty(value)?);
-        }
-    }
-    Ok(())
-}
-
-fn jq_exit_status(last: Option<&Value>) -> u8 {
-    match last {
-        Some(Value::Bool(false) | Value::Null) => 1,
-        Some(_) => 0,
-        None => 4,
-    }
 }
 
 fn parse_limit(value: &str) -> Result<usize, String> {

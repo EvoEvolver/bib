@@ -22,23 +22,38 @@ const SAMPLE: &str = r#"% retained comment
 "#;
 
 #[test]
-fn top_level_help_documents_query_edit_and_review_workflow() {
+fn top_level_help_documents_inspect_pipe_and_review_workflow() {
     Command::cargo_bin("bib")
         .unwrap()
         .arg("--help")
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("INPUT OBJECT")
-                .and(predicate::str::contains("QUERY EXAMPLES"))
-                .and(predicate::str::contains("EDITING"))
+            predicate::str::contains("INSPECT AND PIPE")
                 .and(predicate::str::contains("LITERATURE SOURCES"))
+                .and(predicate::str::contains("SCOPE"))
                 .and(predicate::str::contains("INTEGRITY"))
                 .and(predicate::str::contains("EXIT STATUS"))
-                .and(predicate::str::contains(".fields.year = \"2026\""))
                 .and(predicate::str::contains(
-                    "bib integrity add updated.bib --key paper1 --source agent --agent MODEL --in-place",
+                    "bib integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place",
+                ))
+                .and(predicate::str::contains(
+                    "does not provide arbitrary metadata editing",
                 )),
+        );
+}
+
+#[test]
+fn inspect_help_defines_external_pipeline_contract() {
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["inspect", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("one JSON array")
+                .and(predicate::str::contains("bib inspect refs.bib | jq"))
+                .and(predicate::str::contains("does not evaluate filters")),
         );
 }
 
@@ -125,14 +140,21 @@ fn provider_apply_does_not_write_invalid_bibtex() {
 }
 
 #[test]
-fn query_supports_jq_filters_and_raw_output() {
-    Command::cargo_bin("bib")
+fn inspect_emits_pipeline_ready_json_from_stdin() {
+    let output = Command::cargo_bin("bib")
         .unwrap()
-        .args(["-r", ".[] | select(.type == \"article\") | .id", "-"])
+        .args(["inspect", "-", "--json", "--compact"])
         .write_stdin(SAMPLE)
         .assert()
         .success()
-        .stdout("alpha\n");
+        .get_output()
+        .stdout
+        .clone();
+    let entries: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 2);
+    assert_eq!(entries[0]["id"], "alpha");
+    assert_eq!(entries[0]["type"], "article");
+    assert_eq!(entries[0]["integrity"]["status"], "unverified");
 }
 
 #[test]
@@ -262,13 +284,19 @@ fn agent_integrity_creates_attributed_source_entry() {
         .success()
         .stdout("verified\talpha\tagent\n");
 
-    Command::cargo_bin("bib")
+    let inspected = Command::cargo_bin("bib")
         .unwrap()
-        .args(["-r", ".[].id"])
+        .args(["inspect"])
         .arg(&path)
         .assert()
         .success()
-        .stdout("alpha\nbeta\n");
+        .get_output()
+        .stdout
+        .clone();
+    let entries: serde_json::Value = serde_json::from_slice(&inspected).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 2);
+    assert_eq!(entries[0]["id"], "alpha");
+    assert_eq!(entries[1]["id"], "beta");
 
     fs::write(
         &path,
@@ -283,6 +311,93 @@ fn agent_integrity_creates_attributed_source_entry() {
         .assert()
         .code(3)
         .stdout("invalid\talpha\tagent\n");
+}
+
+#[test]
+fn integrity_add_reads_agent_selected_keys_from_stdin() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--keys-from",
+            "-",
+            "--source",
+            "agent",
+            "--agent",
+            "pipeline-agent",
+            "--in-place",
+        ])
+        .write_stdin("alpha\n\n")
+        .assert()
+        .success();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .args(["--keys-from", "-"])
+        .write_stdin("alpha\n")
+        .assert()
+        .success()
+        .stdout("verified\talpha\tagent\n");
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .args(["--key", "beta"])
+        .assert()
+        .code(3)
+        .stdout("unverified\tbeta\n");
+
+    let keys_path = directory.path().join("approved.keys");
+    fs::write(&keys_path, "alpha\n").unwrap();
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "remove"])
+        .arg(&path)
+        .arg("--keys-from")
+        .arg(&keys_path)
+        .arg("--in-place")
+        .assert()
+        .success();
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .args(["--key", "alpha"])
+        .assert()
+        .code(3)
+        .stdout("unverified\talpha\tagent\n");
+}
+
+#[test]
+fn explicit_empty_keys_pipeline_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--keys-from",
+            "-",
+            "--source",
+            "agent",
+            "--agent",
+            "pipeline-agent",
+        ])
+        .write_stdin("\n")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no citation keys found in -"));
 }
 
 #[test]

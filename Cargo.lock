@@ -102,15 +102,12 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bib-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "base64",
  "clap",
- "jaq-core",
- "jaq-json",
- "jaq-std",
  "predicates",
  "quick-xml",
  "reqwest",
@@ -120,12 +117,6 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
-
-[[package]]
-name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
@@ -273,37 +264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "defmt"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
-dependencies = [
- "bitflags 1.3.2",
- "defmt-macros",
-]
-
-[[package]]
-name = "defmt-macros"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
-dependencies = [
- "defmt-parser",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "defmt-parser"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,12 +289,6 @@ dependencies = [
  "quote",
  "syn 3.0.4",
 ]
-
-[[package]]
-name = "dyn-clone"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "equivalent"
@@ -372,12 +326,6 @@ checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
 dependencies = [
  "num-traits",
 ]
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "form_urlencoded"
@@ -485,12 +433,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hifijson"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "242402749acf71e6f32f5857598b7002c4058a4e3c3b22b4c7d51cab9aea754e"
 
 [[package]]
 name = "http"
@@ -723,107 +665,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jaq-core"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f72ba7158fe9fc1bc4baace1b71e6d0d3d27c6839dd87dc1f233dd408f5dd85b"
-dependencies = [
- "dyn-clone",
- "once_cell",
- "typed-arena",
-]
-
-[[package]]
-name = "jaq-json"
-version = "2.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4be2f53207ffb1313a2d2ad819cfa8bfaa7936cb85a110eda10fd5da822cec94"
-dependencies = [
- "bstr",
- "bytes",
- "foldhash",
- "hifijson",
- "indexmap",
- "jaq-core",
- "jaq-std",
- "num-bigint",
- "num-traits",
- "ryu",
- "self_cell",
- "serde_core",
-]
-
-[[package]]
-name = "jaq-std"
-version = "3.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f90e485abfd3189510c996e77be55056a51038b0fa5805e6c97b5dcf0d9ab55"
-dependencies = [
- "aho-corasick",
- "base64",
- "bstr",
- "jaq-core",
- "jiff",
- "libm",
- "log",
- "regex-bites",
- "urlencoding",
-]
-
-[[package]]
-name = "jiff"
-version = "0.2.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "668b7183bd07af9a4885f5c35b0cc5c83c4607a913c16b7e17291832910d2dcc"
-dependencies = [
- "defmt",
- "jiff-core",
- "jiff-static",
- "jiff-tzdb-platform",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde_core",
- "windows-link",
-]
-
-[[package]]
-name = "jiff-core"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7feca88439efe53da3754500c1851dedf3cb36c524dd5cf8225cc0794de95d09"
-dependencies = [
- "defmt",
-]
-
-[[package]]
-name = "jiff-static"
-version = "0.2.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a69dcb3a21cfb32ce1cd056169337ca284af0766dd766e7878819b251a49204"
-dependencies = [
- "jiff-core",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "jiff-tzdb"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "142bd39932ad231f10513df9ab62661fead8719872150b7ad02a2df79f4e141e"
-
-[[package]]
-name = "jiff-tzdb-platform"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
-dependencies = [
- "jiff-tzdb",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -839,12 +680,6 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "libm"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linux-raw-sys"
@@ -894,25 +729,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61807f77802ff30975e01f4f071c8ba10c022052f98b3294119f3e615d13e5be"
 
 [[package]]
-name = "num-bigint"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
-dependencies = [
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.47"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -944,21 +760,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "portable-atomic"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
-
-[[package]]
-name = "portable-atomic-util"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "potential_utf"
@@ -1138,12 +939,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex-bites"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6a15a2fa0bfda9361941c45550896ae87b15cc6c8c939ea350079670332e211"
-
-[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1215,7 +1010,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.13.1",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -1268,12 +1063,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "self_cell"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "serde"
@@ -1550,7 +1339,7 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
- "bitflags 2.13.1",
+ "bitflags",
  "bytes",
  "futures-util",
  "http",
@@ -1600,12 +1389,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "typed-arena"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a"
-
-[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1640,12 +1423,6 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
-
-[[package]]
-name = "urlencoding"
-version = "2.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8_iter"
