@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::bibtex::Record;
+use crate::provenance;
 
 pub const FIELD: &str = "integrity";
 
@@ -18,6 +19,7 @@ pub enum Status {
     Verified,
     Stale,
     Unverified,
+    Invalid,
 }
 
 impl std::fmt::Display for Status {
@@ -26,6 +28,7 @@ impl std::fmt::Display for Status {
             Self::Verified => f.write_str("verified"),
             Self::Stale => f.write_str("stale"),
             Self::Unverified => f.write_str("unverified"),
+            Self::Invalid => f.write_str("invalid"),
         }
     }
 }
@@ -48,10 +51,23 @@ pub fn hash(record: &Record) -> Result<String> {
     Ok(format!("{digest:x}"))
 }
 
-pub fn status(record: &Record) -> Result<Status> {
+pub fn content_hash(record: &Record) -> Result<String> {
+    let mut snapshot = record.clone();
+    snapshot.fields.remove(FIELD);
+    snapshot.fields.remove(provenance::SOURCE_FIELD);
+    hash(&snapshot)
+}
+
+pub fn status(record: &Record, records: &[Record]) -> Result<Status> {
     match record.fields.get(FIELD).map(|value| value.trim()) {
         None | Some("") => Ok(Status::Unverified),
-        Some(stored) if stored == hash(record)? => Ok(Status::Verified),
+        Some(stored) if stored == hash(record)? => {
+            Ok(if provenance::validate(record, records).is_ok() {
+                Status::Verified
+            } else {
+                Status::Invalid
+            })
+        }
         Some(_) => Ok(Status::Stale),
     }
 }
@@ -98,6 +114,8 @@ pub fn update_source(
                 });
             }
         } else {
+            provenance::validate(record, records)
+                .with_context(|| format!("entry {} has invalid provenance", entry.key))?;
             let value = format!("integrity = {{{}}}", hash(record)?);
             if let Some(field) = integrity_fields.first() {
                 edits.push(Edit {
@@ -171,6 +189,26 @@ pub fn update_entry_fields(
     entry_type: &str,
     fields: &BTreeMap<String, String>,
 ) -> Result<String> {
+    update_entry_fields_impl(source, key, entry_type, fields, &[])
+}
+
+pub fn update_entry_fields_exact(
+    source: &str,
+    key: &str,
+    entry_type: &str,
+    fields: &BTreeMap<String, String>,
+    controlled_fields: &[&str],
+) -> Result<String> {
+    update_entry_fields_impl(source, key, entry_type, fields, controlled_fields)
+}
+
+fn update_entry_fields_impl(
+    source: &str,
+    key: &str,
+    entry_type: &str,
+    fields: &BTreeMap<String, String>,
+    controlled_fields: &[&str],
+) -> Result<String> {
     let spans = scan_entries(source)?;
     let entry = spans
         .iter()
@@ -208,6 +246,20 @@ pub fn update_entry_fields(
             }
         } else {
             missing.push(replacement);
+        }
+    }
+
+    for field in &entry.fields {
+        if controlled_fields
+            .iter()
+            .any(|name| field.name.eq_ignore_ascii_case(name))
+            && !fields.contains_key(&field.name)
+        {
+            edits.push(Edit {
+                start: field.segment_start,
+                end: field.remove_end,
+                replacement: String::new(),
+            });
         }
     }
 
@@ -431,29 +483,56 @@ mod tests {
 @misc(Two, title = "Quoted, title")
 "#;
 
+    fn add_agent_integrity(source: &str, key: &str) -> String {
+        let records = parse(source).unwrap();
+        let target = records
+            .iter()
+            .find(|record| record.entry_key == key)
+            .unwrap();
+        let evidence =
+            provenance::actor_source(provenance::SourceKind::Agent, "test-agent", target).unwrap();
+        let with_evidence = provenance::append_source(source, &evidence, &records).unwrap();
+        let with_link = update_entry_fields(
+            &with_evidence,
+            key,
+            &target.entry_type,
+            &BTreeMap::from([(provenance::SOURCE_FIELD.to_owned(), evidence.entry_key)]),
+        )
+        .unwrap();
+        let records = parse(&with_link).unwrap();
+        update_source(
+            &with_link,
+            &records,
+            &BTreeSet::from([key.to_owned()]),
+            false,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn adding_and_removing_preserves_unrelated_source() {
-        let records = parse(SAMPLE).unwrap();
         let selected = BTreeSet::from(["One".to_owned()]);
-        let added = update_source(SAMPLE, &records, &selected, false).unwrap();
+        let added = add_agent_integrity(SAMPLE, "One");
         assert!(added.starts_with("% keep this comment\n@string"));
         assert!(added.contains("integrity = {"));
+        assert!(added.contains("@bibsource"));
+        let records = parse(&added).unwrap();
         assert!(matches!(
-            status(&parse(&added).unwrap()[0]),
+            status(&records[0], &records),
             Ok(Status::Verified)
         ));
 
-        let removed = update_source(&added, &parse(&added).unwrap(), &selected, true).unwrap();
-        assert_eq!(removed, SAMPLE);
+        let removed = update_source(&added, &records, &selected, true).unwrap();
+        assert!(!removed.contains("integrity ="));
+        assert!(removed.contains("@bibsource"));
     }
 
     #[test]
     fn changed_content_makes_integrity_stale() {
-        let records = parse(SAMPLE).unwrap();
-        let selected = BTreeSet::from(["Two".to_owned()]);
-        let added = update_source(SAMPLE, &records, &selected, false).unwrap();
+        let added = add_agent_integrity(SAMPLE, "Two");
         let changed = added.replace("Quoted, title", "Different title");
-        assert_eq!(status(&parse(&changed).unwrap()[1]).unwrap(), Status::Stale);
+        let records = parse(&changed).unwrap();
+        assert_eq!(status(&records[1], &records).unwrap(), Status::Stale);
     }
 
     #[test]
@@ -470,15 +549,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_marker_without_provenance_is_invalid() {
+        let mut record = parse("@article{key, title={A title}}").unwrap().remove(0);
+        record
+            .fields
+            .insert("integrity".to_owned(), hash(&record).unwrap());
+        let records = vec![record];
+        assert_eq!(status(&records[0], &records).unwrap(), Status::Invalid);
+    }
+
+    #[test]
     fn scans_parenthesized_entry_with_closing_paren_in_braces() {
         let source = "@misc(Key, title={A title (revised)}, note={contains ) safely})\n";
-        let records = parse(source).unwrap();
-        let selected = BTreeSet::from(["Key".to_owned()]);
-        let added = update_source(source, &records, &selected, false).unwrap();
-        assert_eq!(
-            status(&parse(&added).unwrap()[0]).unwrap(),
-            Status::Verified
-        );
+        let added = add_agent_integrity(source, "Key");
+        let records = parse(&added).unwrap();
+        assert_eq!(status(&records[0], &records).unwrap(), Status::Verified);
     }
 
     #[test]

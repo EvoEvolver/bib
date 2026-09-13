@@ -7,12 +7,14 @@ use serde_json::Value;
 
 use crate::bibtex::{Record, render};
 use crate::integrity::{Status, hash, status};
+use crate::provenance::{self, SourceSummary};
 
 #[derive(Serialize)]
 struct IntegrityView<'a> {
     status: Status,
     expected: String,
     stored: Option<&'a str>,
+    source: SourceSummary,
 }
 
 #[derive(Serialize)]
@@ -27,15 +29,17 @@ struct EntryView<'a> {
 pub fn input(records: &[Record]) -> Result<Value> {
     let entries = records
         .iter()
+        .filter(|record| !record.is_provenance())
         .map(|record| {
             Ok(EntryView {
                 id: &record.entry_key,
                 entry_type: &record.entry_type,
                 fields: &record.fields,
                 integrity: IntegrityView {
-                    status: status(record)?,
+                    status: status(record, records)?,
                     expected: hash(record)?,
                     stored: record.fields.get("integrity").map(String::as_str),
+                    source: provenance::summary(record, records),
                 },
             })
         })
@@ -103,9 +107,15 @@ fn value_to_record(value: &Value) -> Result<Record> {
         fields: std::collections::BTreeMap<String, String>,
     }
 
-    let entry: FilteredEntry = serde_json::from_value(value.clone()).context(
+    let mut entry: FilteredEntry = serde_json::from_value(value.clone()).context(
         "--bibtex requires each filter result to be an entry object or an array of entry objects",
     )?;
+    let reserved = ["integrity", "bibsource", "bibprovider", "bibproviderid"];
+    entry.fields.retain(|field, _| {
+        !reserved
+            .iter()
+            .any(|reserved| field.eq_ignore_ascii_case(reserved))
+    });
     Ok(Record {
         entry_type: entry.entry_type,
         entry_key: entry.id,
@@ -141,5 +151,20 @@ mod tests {
         let bibtex = render_bibtex(&output).unwrap();
         assert!(bibtex.contains("@book{two,"));
         assert!(!bibtex.contains("@article"));
+    }
+
+    #[test]
+    fn bibtex_output_strips_reserved_trust_fields() {
+        let records = parse("@article{one, title={One}}").unwrap();
+        let output = execute(
+            r#"map(.fields.Integrity = "forged" | .fields.bibsource = "fake" | .fields.bibprovider = "crossref" | .fields.bibproviderid = "10.1/fake")"#,
+            input(&records).unwrap(),
+        )
+        .unwrap();
+        let bibtex = render_bibtex(&output).unwrap();
+        assert!(bibtex.contains("title = {One}"));
+        assert!(!bibtex.contains("integrity"));
+        assert!(!bibtex.contains("bibsource"));
+        assert!(!bibtex.contains("bibprovider"));
     }
 }

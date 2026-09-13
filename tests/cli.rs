@@ -37,7 +37,7 @@ fn top_level_help_documents_query_edit_and_review_workflow() {
                 .and(predicate::str::contains("EXIT STATUS"))
                 .and(predicate::str::contains(".fields.year = \"2026\""))
                 .and(predicate::str::contains(
-                    "bib integrity add updated.bib --key paper1 --in-place",
+                    "bib integrity add updated.bib --key paper1 --source agent --agent MODEL --in-place",
                 )),
         );
 }
@@ -51,7 +51,8 @@ fn source_help_explains_provider_and_review_workflow() {
         .success()
         .stdout(
             predicate::str::contains("bib source plan refs.bib")
-                .and(predicate::str::contains("bibprovider = {name}"))
+                .and(predicate::str::contains("@bibsource"))
+                .and(predicate::str::contains("exact base64-encoded response"))
                 .and(predicate::str::contains("bib integrity add refs.bib")),
         );
 }
@@ -144,6 +145,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
+        .args(["--key", "alpha"])
         .assert()
         .code(3)
         .stdout(predicate::str::contains("unverified\talpha"));
@@ -152,7 +154,14 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
-        .args(["--all", "--in-place"])
+        .args([
+            "--all",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--in-place",
+        ])
         .assert()
         .success();
 
@@ -163,6 +172,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
+        .args(["--key", "alpha"])
         .assert()
         .success()
         .stdout(predicate::str::contains("verified\talpha"));
@@ -179,7 +189,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .args(["--key", "alpha"])
         .assert()
         .code(3)
-        .stdout("stale\talpha\n");
+        .stdout("stale\talpha\tagent\n");
 }
 
 #[test]
@@ -192,6 +202,7 @@ fn add_requires_an_explicit_review_selection() {
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
+        .args(["--source", "agent", "--agent", "test-agent"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
@@ -199,7 +210,187 @@ fn add_requires_an_explicit_review_selection() {
         ));
 }
 
+#[test]
+fn integrity_add_requires_explicit_provenance_kind() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args(["--key", "alpha"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--source <SOURCE>"));
+}
+
+#[test]
+fn agent_integrity_creates_attributed_source_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "claude-code/test",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(output.contains("bibsource = {bibsource:agent:"));
+    assert!(output.contains("@bibsource"));
+    assert!(output.contains("kind = {agent}"));
+    assert!(output.contains("actor = {claude-code/test}"));
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .args(["--key", "alpha"])
+        .assert()
+        .success()
+        .stdout("verified\talpha\tagent\n");
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["-r", ".[].id"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("alpha\nbeta\n");
+
+    fs::write(
+        &path,
+        output.replace("actor = {claude-code/test}", "actor = {other-agent}"),
+    )
+    .unwrap();
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .args(["--key", "alpha"])
+        .assert()
+        .code(3)
+        .stdout("invalid\talpha\tagent\n");
+}
+
+#[test]
+fn crossref_pipeline_records_raw_response_and_adds_valid_integrity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{paper1, doi={10.1234/example}, volume={stale}, pages={1--2}, note={local}}\n",
+    )
+    .unwrap();
+    let body = r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Provider title"],"author":[{"given":"Jane","family":"Doe"}],"issued":{"date-parts":[[2026]]}}}"#;
+    let base_url = mock_crossref(body);
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args(["--key", "paper1", "--add-integrity", "--in-place"])
+        .assert()
+        .success();
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(output.contains("kind = {provider}"));
+    assert!(output.contains("provider = {crossref}"));
+    assert!(output.contains("mediatype = {application/vnd.crossref-api-message+json}"));
+    assert!(output.contains("responsesha256 = {"));
+    assert!(output.contains("responseencoding = {base64}"));
+    assert!(!output.contains("volume = {stale}"));
+    assert!(!output.contains("pages = {1--2}"));
+    let parsed = bib_cli::bibtex::parse(&output).unwrap();
+    let paper = parsed
+        .iter()
+        .find(|record| record.entry_key == "paper1")
+        .unwrap();
+    assert_eq!(paper.fields.get("note").map(String::as_str), Some("local"));
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("verified\tpaper1\tprovider\n");
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["source", "raw"])
+        .arg(&path)
+        .args(["--key", "paper1"])
+        .assert()
+        .success()
+        .stdout(body);
+
+    fs::write(&path, output.replace("response = {", "response = {WA==")).unwrap();
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .assert()
+        .code(3)
+        .stdout("invalid\tpaper1\tprovider\n");
+}
+
+#[test]
+fn doi_content_negotiation_pipeline_is_provider_backed() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, "@article{paper1, doi={10.1234/example}}\n").unwrap();
+    let base_url = mock_response(
+        "application/x-bibtex",
+        "@article{remote, title={DOI title}, author={Doe, Jane}, year={2026}, doi={10.1234/example}}",
+    );
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_DOI_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args([
+            "--key",
+            "paper1",
+            "--provider",
+            "doi",
+            "--add-integrity",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(output.contains("title = {DOI title}"));
+    assert!(output.contains("provider = {doi}"));
+    assert!(output.contains("mediatype = {application/x-bibtex}"));
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(path)
+        .assert()
+        .success()
+        .stdout("verified\tpaper1\tprovider\n");
+}
+
 fn mock_crossref(body: &'static str) -> String {
+    mock_response("application/json", body)
+}
+
+fn mock_response(content_type: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     thread::spawn(move || {
@@ -208,7 +399,7 @@ fn mock_crossref(body: &'static str) -> String {
         let _ = stream.read(&mut request).unwrap();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_bibtex::MacroDictionary;
 use serde_bibtex::de::Deserializer;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -21,11 +22,17 @@ impl Record {
             .collect();
         self
     }
+
+    pub fn is_provenance(&self) -> bool {
+        self.entry_type.eq_ignore_ascii_case("bibsource")
+    }
 }
 
 pub fn parse(source: &str) -> Result<Vec<Record>> {
     let mut records = Vec::new();
-    for (index, record) in Deserializer::from_str(source)
+    let mut macros = MacroDictionary::default();
+    macros.set_month_macros();
+    for (index, record) in Deserializer::from_str_with_macros(source, macros)
         .into_iter_regular_entry::<Record>()
         .enumerate()
     {
@@ -63,5 +70,11 @@ mod tests {
         assert_eq!(entries[0].entry_type, "article");
         assert_eq!(entries[0].fields["title"], "A {Great} Paper");
         assert_eq!(entries[0].fields["journal"], "A Conference");
+    }
+
+    #[test]
+    fn resolves_standard_month_macros() {
+        let entries = parse("@article{Key, month = Apr}").unwrap();
+        assert_eq!(entries[0].fields["month"], "4");
     }
 }

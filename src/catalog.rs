@@ -85,6 +85,50 @@ pub struct LiteratureRecord {
 }
 
 impl LiteratureRecord {
+    pub fn from_bibtex_record(provider: &str, id: &str, record: &Record) -> Self {
+        let fields = &record.fields;
+        Self {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            record_type: match record.entry_type.as_str() {
+                "article" => "journal-article",
+                "inproceedings" => "proceedings-article",
+                "incollection" => "book-chapter",
+                "book" => "book",
+                "phdthesis" => "dissertation",
+                "techreport" => "report",
+                other => other,
+            }
+            .to_owned(),
+            title: fields.get("title").cloned(),
+            authors: parse_contributors(fields.get("author")),
+            editors: parse_contributors(fields.get("editor")),
+            container_title: fields
+                .get("journal")
+                .or_else(|| fields.get("booktitle"))
+                .cloned(),
+            publisher: fields.get("publisher").cloned(),
+            issued: fields
+                .get("year")
+                .and_then(|year| year.trim().parse().ok())
+                .map(|year| PublicationDate {
+                    year,
+                    month: fields
+                        .get("month")
+                        .and_then(|month| month.trim().parse().ok()),
+                    day: None,
+                }),
+            volume: fields.get("volume").cloned(),
+            issue: fields.get("number").cloned(),
+            pages: fields.get("pages").cloned(),
+            article_number: fields.get("eid").cloned(),
+            doi: fields.get("doi").cloned(),
+            url: fields.get("url").cloned(),
+            isbn: fields.get("isbn").cloned().into_iter().collect(),
+            issn: fields.get("issn").cloned().into_iter().collect(),
+        }
+    }
+
     pub fn bibtex_type(&self) -> &'static str {
         match self.record_type.as_str() {
             "journal-article" => "article",
@@ -151,6 +195,27 @@ impl LiteratureRecord {
         fields.insert(PROVIDER_ID_FIELD.into(), self.id.clone());
         fields
     }
+}
+
+fn parse_contributors(value: Option<&String>) -> Vec<Contributor> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(" and "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.split_once(',') {
+            Some((family, given)) => Contributor {
+                family: family.trim().to_owned(),
+                given: Some(given.trim().to_owned()).filter(|value| !value.is_empty()),
+                orcid: None,
+            },
+            None => Contributor {
+                family: value.to_owned(),
+                given: None,
+                orcid: None,
+            },
+        })
+        .collect()
 }
 
 fn insert_option(fields: &mut BTreeMap<String, String>, name: &str, value: Option<String>) {

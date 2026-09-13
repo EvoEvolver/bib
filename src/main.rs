@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -10,21 +10,28 @@ use bib_cli::catalog::{
     BibliographicQuery, Candidate, FieldChange, LiteratureIdentifier, LiteratureRecord,
     PROVIDER_FIELD, PROVIDER_ID_FIELD, changes,
 };
-use bib_cli::integrity::{Status, atomic_write, hash, status, update_entry_fields, update_source};
+use bib_cli::integrity::{
+    Status, atomic_write, hash, status, update_entry_fields, update_entry_fields_exact,
+    update_source,
+};
+use bib_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SourceKind};
 use bib_cli::providers::{self, DEFAULT_PROVIDER};
 use bib_cli::query;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
 
-const LONG_ABOUT: &str = "Reconcile BibTeX with pluggable literature metadata providers, query and transform entries with jq-compatible filters, then add integrity markers to records that have been explicitly reviewed. Crossref is the default provider. Query input is an array of entry objects; query results go to stdout and never overwrite input files.";
+const LONG_ABOUT: &str = "Reconcile BibTeX with pluggable literature metadata providers, preserve raw API evidence, query and transform entries with jq-compatible filters, then add source-bound integrity markers. Every integrity marker must reference a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
 
 const AFTER_HELP: &str = r#"INPUT OBJECT
   {
     "id": "paper1",
     "type": "article",
     "fields": {"title": "A Paper", "year": "2026"},
-    "integrity": {"status": "unverified", "expected": "...", "stored": null}
+    "integrity": {
+      "status": "unverified", "expected": "...", "stored": null,
+      "source": {"key": null, "kind": null, "valid": false, "error": "..."}
+    }
   }
 
 QUERY EXAMPLES
@@ -48,26 +55,32 @@ LITERATURE SOURCES
   candidates and exits 3; inspect them and pass the chosen record id explicitly:
     bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
 
-  Apply writes bibprovider and bibproviderid fields and preserves citation keys, comments,
-  string declarations, local fields, and fields absent from provider metadata. It
-  never adds integrity; review the diff and approve the entry separately.
+  Apply writes a separate @bibsource entry containing the exact API response, its
+  SHA-256, request URL, media type, provider, and record id. To reconcile and seal
+  an exact provider projection in one atomic operation:
+    bib source apply refs.bib --key paper1 --add-integrity --in-place
+
+  Use --provider doi for DOI content negotiation (raw application/x-bibtex) or
+  --provider crossref for the Crossref works API (raw JSON).
 
 EDITING
   Filters can change entry objects. Use --bibtex to serialize them back to BibTeX:
     bib --bibtex 'map(if .id == "paper1" then .fields.year = "2026" else . end)' refs.bib > updated.bib
 
-  Query mode writes only to stdout. After replacing a file, changed entries with an
-  existing marker report "stale". Review the result, then approve explicit keys:
+  Query mode writes only to stdout. --bibtex strips integrity, bibsource,
+  bibprovider, and bibproviderid so filters cannot forge trust metadata. After
+  replacing a file, review the result, then approve explicit keys:
     bib integrity status updated.bib
-    bib integrity add updated.bib --key paper1 --in-place
+    bib integrity add updated.bib --key paper1 --source agent --agent MODEL --in-place
 
 INTEGRITY
   verified    Stored integrity matches the current covered fields.
   stale       A marker exists, but the covered fields have changed.
   unverified  No integrity marker exists.
+  invalid     The marker matches, but provenance is missing, damaged, or inconsistent.
 
-  Run 'bib integrity --help' for status, hash, add, and remove commands. Adding
-  integrity always requires one or more --key options or an explicit --all.
+  Adding integrity always requires --source provider, --source agent --agent ID,
+  or --source human --reviewer ID, plus one or more --key options or --all.
 
 EXIT STATUS
   0  Success (or every selected entry is verified for 'integrity status')
@@ -81,14 +94,33 @@ const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
   2. For a DOI-backed exact match, apply it directly. For search results, pass the
      chosen candidate id explicitly with --id:
        bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
-  3. Review the resulting entry, then record human approval separately:
-       bib integrity add refs.bib --key paper1 --in-place
+  3. Either add provider-backed integrity atomically with apply:
+       bib source apply refs.bib --key paper1 --add-integrity --in-place
+     or record an attributed review separately:
+       bib integrity add refs.bib --key paper1 --source agent --agent MODEL --in-place
 
 PROVENANCE
-  Applied entries receive bibprovider = {name} and bibproviderid = {id}. These
-  record where normalized metadata came from and are separate from the integrity
-  marker. Crossref is the default provider. Set BIB_MAILTO or pass --mailto for
-  polite API identification."#;
+  Apply creates @bibsource evidence with the exact base64-encoded response and
+  SHA-256. The literature entry references it through bibsource. Verification
+  replays the provider projection offline and rejects changed raw data or metadata.
+  Crossref is the default; doi is exact-lookup-only. Set BIB_MAILTO or pass
+  --mailto for polite Crossref API identification. Recover verified response
+  bytes with: bib source raw refs.bib --key paper1"#;
+
+const INTEGRITY_AFTER_HELP: &str = r#"SOURCE MODES
+  provider  Reuse @bibsource evidence created by `bib source apply`. Raw response,
+            response hash, provider identity, and projected fields are validated.
+  agent     Create @bibsource kind={agent}; requires --agent MODEL_OR_AGENT_ID.
+  human     Create @bibsource kind={human}; requires --reviewer REVIEWER_ID.
+
+EXAMPLES
+  bib integrity add refs.bib --key paper1 --source provider --in-place
+  bib integrity add refs.bib --key draft1 --source agent --agent claude-code --in-place
+  bib integrity add refs.bib --key paper1 --source human --reviewer alice --in-place
+
+Agent and human modes are attributed assertions, not cryptographic identities.
+Provider mode proves deterministic agreement with the stored response bytes; it
+does not prove that a manually forged response was genuinely served by the API."#;
 
 #[derive(Parser)]
 #[command(
@@ -199,13 +231,24 @@ enum SourceCommand {
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
         in_place: bool,
+        /// Add provider-backed integrity after storing and validating the raw response.
+        #[arg(long)]
+        add_integrity: bool,
         /// Email sent to providers that support polite API identification.
         #[arg(long, env = "BIB_MAILTO")]
         mailto: Option<String>,
     },
+    /// Write the validated, exact provider response bytes to stdout.
+    Raw {
+        file: PathBuf,
+        /// Citation key whose provider evidence should be emitted.
+        #[arg(short, long)]
+        key: String,
+    },
 }
 
 #[derive(Args)]
+#[command(after_help = INTEGRITY_AFTER_HELP)]
 struct IntegrityArgs {
     #[command(subcommand)]
     command: IntegrityCommand,
@@ -237,6 +280,15 @@ enum IntegrityCommand {
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
         in_place: bool,
+        /// Required provenance kind.
+        #[arg(long, value_enum)]
+        source: IntegritySourceArg,
+        /// Agent/model identifier, required with `--source agent`.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Human reviewer identifier, required with `--source human`.
+        #[arg(long)]
+        reviewer: Option<String>,
     },
     /// Remove integrity from selected entries.
     Remove {
@@ -253,12 +305,20 @@ enum IntegrityCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum IntegritySourceArg {
+    Provider,
+    Agent,
+    Human,
+}
+
 #[derive(Serialize)]
 struct StatusRow<'a> {
     id: &'a str,
     status: Status,
     expected: String,
     stored: Option<&'a str>,
+    source: provenance::SourceSummary,
 }
 
 #[derive(Serialize)]
@@ -388,7 +448,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 });
                 if let Some(identifier) = identifier {
                     match backend.lookup(&identifier) {
-                        Ok(candidate) => rows.push(PlanRow {
+                        Ok(fetched) => rows.push(PlanRow {
                             id: record.entry_key.clone(),
                             provider: provider_name.clone(),
                             status: "exact",
@@ -398,7 +458,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                                 record,
                                 Candidate {
                                     score: None,
-                                    record: candidate,
+                                    record: fetched.record,
                                 },
                             )],
                         }),
@@ -449,6 +509,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             id,
             provider,
             in_place,
+            add_integrity,
             mailto,
         } => {
             let source = read_file(&file)?;
@@ -470,22 +531,55 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 })
                 .context("no exact provider id; pass --id after selecting a search candidate")?;
             let backend = providers::open(&provider_name, mailto.as_deref())?;
-            let provider_record = backend.lookup(&identifier)?;
-            let fields = provider_record.bibtex_fields();
-            let output =
-                update_entry_fields(&source, &key, provider_record.bibtex_type(), &fields)?;
-            parse(&output)
+            let fetched = backend.lookup(&identifier)?;
+            let provider_source = provenance::provider_source(&fetched);
+            let mut fields = fetched.record.bibtex_fields();
+            fields.insert(SOURCE_FIELD.to_owned(), provider_source.entry_key.clone());
+            let output = update_entry_fields_exact(
+                &source,
+                &key,
+                fetched.record.bibtex_type(),
+                &fields,
+                CONTROLLED_FIELDS,
+            )?;
+            let records_after_fields = parse(&output)
                 .context("provider update produced invalid BibTeX; file was not changed")?;
+            let mut output =
+                provenance::append_source(&output, &provider_source, &records_after_fields)?;
+            if add_integrity {
+                let records = parse(&output)?;
+                output = update_source(&output, &records, &BTreeSet::from([key.clone()]), false)?;
+            }
             if in_place {
                 atomic_write(&file, &output)?;
                 eprintln!(
-                    "updated {key} from {provider_name}:{} in {}; review it before adding integrity",
-                    provider_record.id,
-                    file.display()
+                    "updated {key} from {provider_name}:{} in {}; raw response recorded as {}{}",
+                    fetched.record.id,
+                    file.display(),
+                    provider_source.entry_key,
+                    if add_integrity {
+                        " and provider integrity added"
+                    } else {
+                        "; review it before adding integrity"
+                    }
                 );
             } else {
                 print!("{output}");
             }
+            Ok(0)
+        }
+        SourceCommand::Raw { file, key } => {
+            let source = read_file(&file)?;
+            let records = parse(&source)?;
+            let record = records
+                .iter()
+                .find(|record| !record.is_provenance() && record.entry_key == key)
+                .with_context(|| format!("citation key not found: {key}"))?;
+            let response = provenance::raw_response(record, &records)
+                .with_context(|| format!("provider evidence for {key} is not valid"))?;
+            io::stdout()
+                .write_all(&response)
+                .context("could not write provider response to stdout")?;
             Ok(0)
         }
     }
@@ -527,7 +621,7 @@ fn select_records(records: &[Record], keys: Vec<String>, all: bool) -> Result<Ve
     ensure_keys_exist(records, &selected)?;
     Ok(records
         .iter()
-        .filter(|record| all || selected.contains(&record.entry_key))
+        .filter(|record| !record.is_provenance() && (all || selected.contains(&record.entry_key)))
         .collect())
 }
 
@@ -547,18 +641,22 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             let records = parse(&source)?;
             let selected: BTreeSet<_> = key.into_iter().collect();
             ensure_keys_exist(&records, &selected)?;
-            let records: Vec<_> = records
+            let bibliography: Vec<_> = records
                 .iter()
-                .filter(|record| selected.is_empty() || selected.contains(&record.entry_key))
+                .filter(|record| {
+                    !record.is_provenance()
+                        && (selected.is_empty() || selected.contains(&record.entry_key))
+                })
                 .collect();
-            let rows = records
+            let rows = bibliography
                 .iter()
                 .map(|record| {
                     Ok(StatusRow {
                         id: &record.entry_key,
-                        status: status(record)?,
+                        status: status(record, &records)?,
                         expected: hash(record)?,
                         stored: record.fields.get("integrity").map(String::as_str),
+                        source: provenance::summary(record, &records),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -566,7 +664,13 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 for row in &rows {
-                    println!("{}\t{}", row.status, row.id);
+                    let origin = row
+                        .source
+                        .kind
+                        .as_deref()
+                        .map(|kind| format!("\t{kind}"))
+                        .unwrap_or_default();
+                    println!("{}\t{}{}", row.status, row.id, origin);
                 }
             }
             Ok(if rows.iter().all(|row| row.status == Status::Verified) {
@@ -590,28 +694,92 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             key,
             all,
             in_place,
-        } => change_integrity(&file, key, all, in_place, false),
+            source,
+            agent,
+            reviewer,
+        } => add_integrity(&file, key, all, in_place, source, agent, reviewer),
         IntegrityCommand::Remove {
             file,
             key,
             all,
             in_place,
-        } => change_integrity(&file, key, all, in_place, true),
+        } => remove_integrity(&file, key, all, in_place),
     }
 }
 
-fn change_integrity(
+fn add_integrity(
     file: &Path,
     keys: Vec<String>,
     all: bool,
     in_place: bool,
-    remove: bool,
+    source_kind: IntegritySourceArg,
+    agent: Option<String>,
+    reviewer: Option<String>,
 ) -> Result<u8> {
+    let actor = match source_kind {
+        IntegritySourceArg::Provider => {
+            if agent.is_some() || reviewer.is_some() {
+                bail!("--source provider does not accept --agent or --reviewer");
+            }
+            None
+        }
+        IntegritySourceArg::Agent => {
+            if reviewer.is_some() {
+                bail!("--source agent does not accept --reviewer");
+            }
+            Some((
+                SourceKind::Agent,
+                agent.context("--source agent requires --agent ID")?,
+            ))
+        }
+        IntegritySourceArg::Human => {
+            if agent.is_some() {
+                bail!("--source human does not accept --agent");
+            }
+            Some((
+                SourceKind::Human,
+                reviewer.context("--source human requires --reviewer ID")?,
+            ))
+        }
+    };
+    let mut source = read_file(file)?;
+    let mut records = parse(&source)?;
+    let selected = selected_keys(&records, keys, all)?;
+    if let Some((kind, actor)) = actor {
+        for key in &selected {
+            let target = records
+                .iter()
+                .find(|record| record.entry_key == *key)
+                .cloned()
+                .with_context(|| format!("citation key not found: {key}"))?;
+            let evidence = provenance::actor_source(kind, &actor, &target)?;
+            source = provenance::append_source(&source, &evidence, &records)?;
+            source = update_entry_fields(
+                &source,
+                key,
+                &target.entry_type,
+                &BTreeMap::from([(SOURCE_FIELD.to_owned(), evidence.entry_key)]),
+            )?;
+            records = parse(&source)?;
+        }
+    }
+    let output = update_source(&source, &records, &selected, false)?;
+    write_changed(file, &output, &selected, in_place, "updated")
+}
+
+fn remove_integrity(file: &Path, keys: Vec<String>, all: bool, in_place: bool) -> Result<u8> {
     let source = read_file(file)?;
     let records = parse(&source)?;
+    let selected = selected_keys(&records, keys, all)?;
+    let output = update_source(&source, &records, &selected, true)?;
+    write_changed(file, &output, &selected, in_place, "removed")
+}
+
+fn selected_keys(records: &[Record], keys: Vec<String>, all: bool) -> Result<BTreeSet<String>> {
     let selected = if all {
         records
             .iter()
+            .filter(|record| !record.is_provenance())
             .map(|record| record.entry_key.clone())
             .collect()
     } else {
@@ -621,13 +789,21 @@ fn change_integrity(
         }
         selected
     };
-    ensure_keys_exist(&records, &selected)?;
-    let output = update_source(&source, &records, &selected, remove)?;
+    ensure_keys_exist(records, &selected)?;
+    Ok(selected)
+}
+
+fn write_changed(
+    file: &Path,
+    output: &str,
+    selected: &BTreeSet<String>,
+    in_place: bool,
+    action: &str,
+) -> Result<u8> {
     if in_place {
-        atomic_write(file, &output)?;
+        atomic_write(file, output)?;
         eprintln!(
-            "{} integrity for {} entr{} in {}",
-            if remove { "removed" } else { "updated" },
+            "{action} integrity for {} entr{} in {}",
             selected.len(),
             if selected.len() == 1 { "y" } else { "ies" },
             file.display()
@@ -639,7 +815,11 @@ fn change_integrity(
 }
 
 fn ensure_keys_exist(records: &[Record], selected: &BTreeSet<String>) -> Result<()> {
-    let existing: BTreeSet<_> = records.iter().map(|record| &record.entry_key).collect();
+    let existing: BTreeSet<_> = records
+        .iter()
+        .filter(|record| !record.is_provenance())
+        .map(|record| &record.entry_key)
+        .collect();
     for key in selected {
         if !existing.contains(key) {
             bail!("citation key not found: {key}");

@@ -13,7 +13,7 @@ use crate::catalog::{
     PublicationDate,
 };
 
-use super::LiteratureProvider;
+use super::{FetchedRecord, LiteratureProvider};
 
 const DEFAULT_BASE_URL: &str = "https://api.crossref.org/";
 
@@ -61,7 +61,7 @@ impl CrossrefProvider {
         Ok(url)
     }
 
-    fn get<T: for<'de> Deserialize<'de>>(&self, mut url: Url) -> Result<T> {
+    fn get(&self, mut url: Url) -> Result<(String, Vec<u8>)> {
         if let Some(mailto) = &self.mailto {
             url.query_pairs_mut().append_pair("mailto", mailto);
         }
@@ -73,9 +73,11 @@ impl CrossrefProvider {
                 .with_context(|| format!("could not contact Crossref at {url}"))?;
             let status = response.status();
             if status.is_success() {
-                return response
-                    .json()
-                    .with_context(|| format!("invalid Crossref response from {url}"));
+                let final_url = response.url().clone();
+                let bytes = response
+                    .bytes()
+                    .with_context(|| format!("could not read Crossref response from {url}"))?;
+                return Ok((sanitized_url(final_url), bytes.to_vec()));
             }
             if (status.as_u16() == 429 || status.is_server_error()) && attempt < 2 {
                 let retry_after = response
@@ -99,9 +101,15 @@ impl LiteratureProvider for CrossrefProvider {
         "crossref"
     }
 
-    fn lookup(&self, identifier: &LiteratureIdentifier) -> Result<LiteratureRecord> {
-        let response: SingletonResponse = self.get(self.works_url(Some(identifier.value()))?)?;
-        Ok(response.message.into_record(self.name()))
+    fn lookup(&self, identifier: &LiteratureIdentifier) -> Result<FetchedRecord> {
+        let (request_url, response) = self.get(self.works_url(Some(identifier.value()))?)?;
+        let record = record_from_response(&response)?;
+        Ok(FetchedRecord {
+            record,
+            request_url,
+            media_type: "application/vnd.crossref-api-message+json".to_owned(),
+            response,
+        })
     }
 
     fn search(&self, query: &BibliographicQuery, limit: usize) -> Result<Vec<Candidate>> {
@@ -112,7 +120,9 @@ impl LiteratureProvider for CrossrefProvider {
         url.query_pairs_mut()
             .append_pair("query.bibliographic", &query.citation)
             .append_pair("rows", &limit.clamp(1, 20).to_string());
-        let response: SearchResponse = self.get(url)?;
+        let (_, response) = self.get(url)?;
+        let response: SearchResponse =
+            serde_json::from_slice(&response).context("invalid Crossref search response")?;
         Ok(response
             .message
             .items
@@ -123,6 +133,27 @@ impl LiteratureProvider for CrossrefProvider {
             })
             .collect())
     }
+}
+
+pub(crate) fn record_from_response(response: &[u8]) -> Result<LiteratureRecord> {
+    let response: SingletonResponse =
+        serde_json::from_slice(response).context("invalid Crossref singleton response")?;
+    Ok(response.message.into_record("crossref"))
+}
+
+fn sanitized_url(mut url: Url) -> String {
+    if url.query().is_some() {
+        let retained = url
+            .query_pairs()
+            .filter(|(key, _)| key != "mailto")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        if !retained.is_empty() {
+            url.query_pairs_mut().extend_pairs(retained);
+        }
+    }
+    url.to_string()
 }
 
 fn normalize_doi(value: &str) -> &str {
