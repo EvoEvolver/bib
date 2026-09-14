@@ -7,8 +7,10 @@ the default metadata backend; DOI content negotiation is also built in.
 
 It is designed for a workflow where an agent edits or researches bibliography
 entries, a human reviews the result, and the agent marks only confirmed citation
-keys. Provider results retain the exact API response. Agent-created records are
-explicitly labeled as agent assertions instead of looking provider-verified.
+keys. Provider results retain compact request, response-hash, and projection-hash
+receipts; response bodies are never embedded in the bibliography. Agent-created
+records are explicitly labeled as agent assertions instead of looking
+provider-verified.
 
 ## Install
 
@@ -28,13 +30,13 @@ Choose another directory or a specific release with environment variables:
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
-  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.4.0 sh
+  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.5.0 sh
 ```
 
 Export the variables first when that reads more clearly:
 
 ```sh
-export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.4.0
+export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.5.0
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
 ```
@@ -57,8 +59,16 @@ Plan metadata replacements for selected entries:
 bib source plan references.bib --key watson1953
 ```
 
-Entries with a DOI receive an exact provider lookup. Entries without one return
-ranked candidates for review. After choosing an exact provider record, apply it
+Entries with a DOI receive an exact provider lookup. When an entry has a URL but
+no DOI, `bib` first looks for stable identifiers in the URL, redirects, publisher
+metadata, JSON-LD, and supported identifier APIs. Try resolution independently:
+
+```sh
+bib source resolve 'https://doi.org/10.1038/171737a0'
+```
+
+One unambiguous DOI can flow directly into the provider lookup. Otherwise `plan`
+returns candidates for review. After choosing an exact provider record, apply it
 without disturbing comments, string declarations, citation keys, or local-only
 fields:
 
@@ -79,8 +89,9 @@ bibsource = {bibsource:provider:...},
 integrity = {...}
 ```
 
-The same file receives an independent evidence entry. The response value is the
-exact HTTP response bytes encoded as base64, not parsed and serialized JSON:
+The same file receives an independent compact receipt. It records where the
+metadata came from and binds the provider-controlled BibTeX fields to a stable
+projection hash without storing the HTTP response body:
 
 ```bibtex
 @bibsource{bibsource:provider:...,
@@ -89,11 +100,18 @@ exact HTTP response bytes encoded as base64, not parsed and serialized JSON:
   providerid = {10.1038/171737a0},
   requesturl = {https://api.crossref.org/works/10.1038%2F171737a0},
   mediatype = {application/vnd.crossref-api-message+json},
-  responseencoding = {base64},
-  response = {...},
   responsesha256 = {...},
   projection = {literature-record-v1},
+  projectionsha256 = {...},
 }
+```
+
+When a URL was resolved first, another `@bibsource` receipt records the input URL,
+resolution method, matched identifier, signals, and any network-response hash.
+The provider receipt links to it through `resolution`. Inspect the chain as JSON:
+
+```sh
+bib source trace references.bib --key watson1953
 ```
 
 Inspect the review status of every entry:
@@ -185,11 +203,13 @@ Edit bibliography data with the appropriate editor or domain tool. Only
 | --- | --- |
 | `bib inspect [FILE ...]` | Emit bibliography entries and trust state as JSON |
 | `bib source providers` | List installed metadata providers |
+| `bib source resolve URL` | Resolve a URL into auditable identifier candidates |
 | `bib source search QUERY` | Search a provider and return ranked common records |
 | `bib source plan FILE --key KEY` | Produce candidates and field-level diffs |
-| `bib source apply FILE --key KEY [--id ID]` | Apply one exact provider record and save raw evidence |
+| `bib source apply FILE --key KEY [--id ID]` | Apply one exact provider record and save a compact receipt |
 | `bib source apply FILE --key KEY --add-integrity` | Apply and add provider-backed integrity atomically |
-| `bib source raw FILE --key KEY` | Emit the validated original API response bytes |
+| `bib source trace FILE --key KEY` | Emit the provider and URL-resolution evidence chain |
+| `bib source strip-responses FILE` | Remove response bodies embedded by versions before 0.5 |
 | `bib integrity status FILE [--json]` | Report `verified`, `stale`, `unverified`, or `invalid` |
 | `bib integrity hash FILE KEY` | Print the expected SHA-256 value |
 | `bib integrity add FILE --key KEY --source SOURCE` | Add attributed or provider-backed integrity |
@@ -222,16 +242,27 @@ export BIB_MAILTO=researcher@example.org
 
 ### Agent review workflow
 
-For entries with an existing DOI or stored provider identifier:
+For entries with an existing DOI, a stored provider identifier, or a resolvable
+URL:
 
 ```sh
 bib source plan references.bib --key paper1
 bib source apply references.bib --key paper1 --add-integrity --in-place
 ```
 
-For entries without an exact identifier, `plan` returns up to five ranked
-candidates and exits with status `3`. An agent should compare title, authors,
-year, venue, record type, and the proposed field diff with the cited work. It
+URL resolution is conservative. A unique DOI from an explicit URL or supported
+metadata signal is eligible for exact lookup. Conflicting identifiers make
+`resolve` and `plan` exit with status `3`; an agent must inspect them rather than
+silently choosing one.
+
+Network URL resolution follows at most five redirects, limits responses to 2 MiB,
+and rejects credentials, non-default ports, localhost, and non-public IP
+addresses. This keeps bibliography URLs from becoming an unrestricted network
+fetch primitive inside an agent workflow.
+
+For entries without an exact identifier after URL resolution, `plan` returns up
+to five ranked provider candidates and exits with status `3`. An agent should
+compare title, authors, year, venue, record type, and the proposed field diff. It
 must not silently choose the highest provider score. Apply only an explicitly
 selected candidate:
 
@@ -241,24 +272,28 @@ bib source apply references.bib \
 ```
 
 `apply` makes provider-controlled fields exactly match the deterministic
-projection of the raw response. Old provider fields absent from the response are
-removed. Local fields such as `file`, `keywords`, `note`, and annotations remain.
-Without `--add-integrity`, raw evidence is still saved and integrity remains a
-separate explicit step:
+projection produced during that provider request. Old provider fields absent
+from the result are removed. Local fields such as `file`, `keywords`, `note`, and
+annotations remain. Without `--add-integrity`, the receipt is still saved and
+integrity remains a separate explicit step:
 
 ```sh
 bib integrity add references.bib --key paper1 --source provider --in-place
 ```
 
-Recover the exact response for another agent pipeline without manually decoding
-the evidence entry:
+`source trace` exposes the compact evidence chain for an agent pipeline. It does
+not fetch the network again and never outputs a stored response body:
 
 ```sh
-bib source raw references.bib --key paper1 > provider-response
+bib source trace references.bib --key paper1 --compact | jq .
 ```
 
-The command refuses agent/human sources, bad response hashes, and metadata that
-no longer matches the replayed provider projection.
+To remove response bodies previously written by `bib` 0.4 or older while keeping
+their compact receipt metadata and citation references:
+
+```sh
+bib source strip-responses references.bib --in-place
+```
 
 Use `--all` with `source plan` to generate a review packet for the complete
 bibliography. Applying records remains intentionally key-by-key so candidate
@@ -348,13 +383,15 @@ The marker uses this deterministic format:
 }
 ```
 
-Verification also validates the referenced source. Provider sources re-hash the
-stored raw response, parse it again without network access, and compare every
-provider-controlled BibTeX field with the replayed projection. Agent and human
+Verification also validates the referenced source. Provider sources bind the
+request metadata and response hash to a projection hash, then compare that hash
+with every current provider-controlled BibTeX field. URL-derived records also
+validate the linked resolution receipt and DOI/provider identity. Agent and human
 sources bind an actor label and content snapshot.
 
-These markers are tamper-evident workflow records, not digital signatures.
-Actor labels are assertions, and a manually fabricated provider response cannot
-be distinguished cryptographically from bytes actually returned by an API.
+These markers are tamper-evident workflow records, not digital signatures or
+archival proofs of an HTTP exchange. Actor labels and provider receipts are
+assertions about what the tool processed; the response hash cannot prove by
+itself that a remote API served those bytes.
 
 Licensed under MIT.

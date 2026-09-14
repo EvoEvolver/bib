@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,15 +12,16 @@ use bib_cli::catalog::{
 };
 use bib_cli::inspect;
 use bib_cli::integrity::{
-    Status, atomic_write, hash, status, update_entry_fields, update_entry_fields_exact,
-    update_source,
+    Status, atomic_write, hash, remove_entry_type_fields, status, update_entry_fields,
+    update_entry_fields_exact, update_source,
 };
-use bib_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SourceKind};
+use bib_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SOURCE_TYPE, SourceKind};
 use bib_cli::providers::{self, DEFAULT_PROVIDER};
+use bib_cli::resolver::{self, ResolutionReport};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-const LONG_ABOUT: &str = "Reconcile BibTeX with pluggable literature metadata providers, preserve raw API evidence, inspect entries as JSON, and add source-bound integrity markers. Every integrity marker must reference a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
+const LONG_ABOUT: &str = "Resolve literature URLs, reconcile BibTeX with pluggable metadata providers, inspect entries as JSON, and add source-bound integrity markers. Provider receipts store response and projection hashes, never response bodies. Every integrity marker references a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
 
 const AFTER_HELP: &str = r#"INSPECT AND PIPE
   Emit bibliography entries and integrity state as one JSON array:
@@ -39,13 +40,17 @@ LITERATURE SOURCES
     bib source plan refs.bib --key paper1
     bib source apply refs.bib --key paper1 --in-place
 
-  An entry with a DOI is looked up exactly. Without a DOI, plan returns ranked
-  candidates and exits 3; inspect them and pass the chosen record id explicitly:
+  A URL is resolved to a stable DOI from the URL itself, redirects, publisher
+  metadata, JSON-LD, or an official identifier API:
+    bib source resolve 'https://doi.org/10.1234/example'
+
+  An entry with a DOI is looked up exactly. Without one, bib tries its URL before
+  returning ranked candidates. Review ambiguous results and pass an id explicitly:
     bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
 
-  Apply writes a separate @bibsource entry containing the exact API response, its
-  SHA-256, request URL, media type, provider, and record id. To reconcile and seal
-  an exact provider projection in one atomic operation:
+  Apply writes a separate @bibsource receipt containing response and projection
+  hashes, request URL, media type, provider, and record id. Response bodies are
+  not embedded in BibTeX. To reconcile and seal an exact provider projection:
     bib source apply refs.bib --key paper1 --add-integrity --in-place
 
   Use --provider doi for DOI content negotiation (raw application/x-bibtex) or
@@ -99,15 +104,18 @@ const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
        bib integrity add refs.bib --key paper1 --source agent --agent MODEL --in-place
 
 PROVENANCE
-  Apply creates @bibsource evidence with the exact base64-encoded response and
-  SHA-256. The literature entry references it through bibsource. Verification
-  replays the provider projection offline and rejects changed raw data or metadata.
-  Crossref is the default; doi is exact-lookup-only. Set BIB_MAILTO or pass
-  --mailto for polite Crossref API identification. Recover verified response
-  bytes with: bib source raw refs.bib --key paper1"#;
+  Apply creates a compact @bibsource receipt with the request URL, media type,
+  response SHA-256, and provider-projection SHA-256. It never embeds response
+  bodies. The literature entry references this receipt through bibsource.
+
+  Entries without a DOI are first resolved from their URL. Conflicting identifiers
+  require review and are never selected by score. Crossref is the default; doi is
+  exact-lookup-only. Set BIB_MAILTO or pass --mailto for polite API identification.
+  Inspect the full evidence chain with:
+    bib source trace refs.bib --key paper1"#;
 
 const INTEGRITY_AFTER_HELP: &str = r#"SOURCE MODES
-  provider  Reuse @bibsource evidence created by `bib source apply`. Raw response,
+  provider  Reuse @bibsource evidence created by `bib source apply`. Receipt key,
             response hash, provider identity, and projected fields are validated.
   agent     Create @bibsource kind={agent}; requires --agent MODEL_OR_AGENT_ID.
   human     Create @bibsource kind={human}; requires --reviewer REVIEWER_ID.
@@ -120,8 +128,22 @@ EXAMPLES
     --source human --reviewer alice --in-place
 
 Agent and human modes are attributed assertions, not cryptographic identities.
-Provider mode proves deterministic agreement with the stored response bytes; it
-does not prove that a manually forged response was genuinely served by the API."#;
+Provider mode proves agreement with the stored projection receipt. Receipts are
+tamper-evident workflow metadata, not proof that an API served particular bytes."#;
+
+const RESOLVE_AFTER_HELP: &str = r#"SIGNALS
+  DOI text in the input or final URL is exact. Publisher citation metadata and
+  JSON-LD are strong signals. Supported repository APIs may provide exact signals.
+  A unique candidate exits 0; no candidate or conflicting candidates exit 3.
+
+  Network receipts include URLs, media type, byte count, and response SHA-256.
+  Response bodies are used only during resolution and are never stored in BibTeX.
+  Non-public hosts, non-default ports, and unsafe redirects are rejected."#;
+
+const TRACE_AFTER_HELP: &str = r#"OUTPUT
+  Emit one JSON object containing the provider receipt and, when present, the URL
+  resolution receipt linked to it. The command validates the chain first and never
+  performs a network request or exposes legacy embedded response bodies."#;
 
 #[derive(Parser)]
 #[command(
@@ -170,6 +192,15 @@ struct SourceArgs {
 enum SourceCommand {
     /// List installed literature metadata providers.
     Providers,
+    /// Resolve a literature URL into evidence-backed identifier candidates.
+    #[command(after_help = RESOLVE_AFTER_HELP)]
+    Resolve {
+        /// HTTP(S) literature page, DOI URL, or supported repository URL.
+        url: String,
+        /// Emit compact JSON.
+        #[arg(short, long)]
+        compact: bool,
+    },
     /// Search a provider and return ranked records as JSON.
     Search {
         query: String,
@@ -217,7 +248,7 @@ enum SourceCommand {
         /// Citation key to update.
         #[arg(short, long)]
         key: String,
-        /// Exact provider record identifier. Uses stored provenance or DOI when omitted.
+        /// Exact provider id. If omitted, uses stored provenance, DOI, or a resolved URL.
         #[arg(long)]
         id: Option<String>,
         /// Metadata provider name. Defaults to stored provenance, then Crossref.
@@ -226,19 +257,30 @@ enum SourceCommand {
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
         in_place: bool,
-        /// Add provider-backed integrity after storing and validating the raw response.
+        /// Add provider-backed integrity after recording the provider receipt.
         #[arg(long)]
         add_integrity: bool,
         /// Email sent to providers that support polite API identification.
         #[arg(long, env = "BIB_MAILTO")]
         mailto: Option<String>,
     },
-    /// Write the validated, exact provider response bytes to stdout.
-    Raw {
+    /// Show the provider and URL-resolution evidence chain for one entry.
+    #[command(after_help = TRACE_AFTER_HELP)]
+    Trace {
         file: PathBuf,
-        /// Citation key whose provider evidence should be emitted.
+        /// Citation key whose evidence chain should be shown.
         #[arg(short, long)]
         key: String,
+        /// Emit compact JSON.
+        #[arg(short, long)]
+        compact: bool,
+    },
+    /// Remove response bodies embedded by bib versions before 0.5.
+    StripResponses {
+        file: PathBuf,
+        /// Atomically update FILE instead of writing the result to stdout.
+        #[arg(short, long)]
+        in_place: bool,
     },
 }
 
@@ -341,6 +383,8 @@ struct PlanRow {
     query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<ResolutionReport>,
     candidates: Vec<PlannedCandidate>,
 }
 
@@ -386,6 +430,12 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             }
             Ok(0)
         }
+        SourceCommand::Resolve { url, compact } => {
+            let report = resolver::resolve_url(&url)?;
+            let resolved = report.candidates.len() == 1;
+            print_serializable(&report, compact)?;
+            Ok(if resolved { 0 } else { 3 })
+        }
         SourceCommand::Search {
             query,
             provider,
@@ -429,6 +479,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                                 status: "error",
                                 query: None,
                                 error: Some(format!("{error:#}")),
+                                resolution: None,
                                 candidates: vec![],
                             });
                             continue;
@@ -438,21 +489,83 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 let Some(backend) = backends.get(&provider_name) else {
                     unreachable!("provider was inserted above")
                 };
-                let identifier = stored_id.map(LiteratureIdentifier::ProviderId).or_else(|| {
-                    record
-                        .fields
-                        .get("doi")
-                        .cloned()
-                        .map(LiteratureIdentifier::Doi)
-                });
+                let mut resolution = None;
+                let mut identifier =
+                    stored_id.map(LiteratureIdentifier::ProviderId).or_else(|| {
+                        record
+                            .fields
+                            .get("doi")
+                            .cloned()
+                            .map(LiteratureIdentifier::Doi)
+                    });
+                if identifier.is_none()
+                    && let Some(url) = record.fields.get("url")
+                {
+                    match resolver::resolve_url(url) {
+                        Ok(report) => match report.exact_candidate() {
+                            Ok(candidate) if candidate.kind == "doi" => {
+                                identifier =
+                                    Some(LiteratureIdentifier::Doi(candidate.value.clone()));
+                                resolution = Some(report);
+                            }
+                            Ok(candidate) => {
+                                needs_review = true;
+                                rows.push(PlanRow {
+                                    id: record.entry_key.clone(),
+                                    provider: provider_name.clone(),
+                                    status: "unsupported-identifier",
+                                    query: None,
+                                    error: Some(format!(
+                                        "resolved {} identifier {}, but {provider_name} cannot look it up",
+                                        candidate.kind, candidate.value
+                                    )),
+                                    resolution: Some(report),
+                                    candidates: vec![],
+                                });
+                                continue;
+                            }
+                            Err(error) => {
+                                needs_review = true;
+                                rows.push(PlanRow {
+                                    id: record.entry_key.clone(),
+                                    provider: provider_name.clone(),
+                                    status: "needs-resolution-review",
+                                    query: None,
+                                    error: Some(format!("{error:#}")),
+                                    resolution: Some(report),
+                                    candidates: vec![],
+                                });
+                                continue;
+                            }
+                        },
+                        Err(error) => {
+                            needs_review = true;
+                            rows.push(PlanRow {
+                                id: record.entry_key.clone(),
+                                provider: provider_name.clone(),
+                                status: "resolution-error",
+                                query: None,
+                                error: Some(format!("{error:#}")),
+                                resolution: None,
+                                candidates: vec![],
+                            });
+                            continue;
+                        }
+                    }
+                }
                 if let Some(identifier) = identifier {
                     match backend.lookup(&identifier) {
                         Ok(fetched) => rows.push(PlanRow {
                             id: record.entry_key.clone(),
                             provider: provider_name.clone(),
-                            status: "exact",
+                            status: if resolution.is_some() {
+                                "resolved-exact"
+                            } else {
+                                "exact"
+                            },
                             query: None,
                             error: None,
+                            resolution,
                             candidates: vec![planned_candidate(
                                 record,
                                 Candidate {
@@ -469,6 +582,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                                 status: "error",
                                 query: None,
                                 error: Some(format!("{error:#}")),
+                                resolution,
                                 candidates: vec![],
                             });
                         }
@@ -483,6 +597,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                             status: "needs-selection",
                             query: Some(query.citation),
                             error: None,
+                            resolution: None,
                             candidates: candidates
                                 .into_iter()
                                 .map(|candidate| planned_candidate(record, candidate))
@@ -494,6 +609,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                             status: "error",
                             query: Some(query.citation),
                             error: Some(format!("{error:#}")),
+                            resolution: None,
                             candidates: vec![],
                         }),
                     }
@@ -518,6 +634,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 .find(|record| record.entry_key == key)
                 .with_context(|| format!("citation key not found: {key}"))?;
             let (provider_name, stored_id) = source_identity(record, provider.as_deref());
+            let mut resolution_candidate = None;
             let identifier = id
                 .map(LiteratureIdentifier::ProviderId)
                 .or_else(|| stored_id.map(LiteratureIdentifier::ProviderId))
@@ -528,10 +645,57 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                         .cloned()
                         .map(LiteratureIdentifier::Doi)
                 })
-                .context("no exact provider id; pass --id after selecting a search candidate")?;
+                .or_else(|| {
+                    let url = record.fields.get("url")?;
+                    match resolver::resolve_url(url) {
+                        Ok(report) => match report.exact_candidate() {
+                            Ok(candidate) if candidate.kind == "doi" => {
+                                resolution_candidate = Some(candidate.clone());
+                                Some(LiteratureIdentifier::Doi(candidate.value.clone()))
+                            }
+                            Ok(candidate) => {
+                                eprintln!(
+                                    "URL resolved to unsupported {} identifier {}; pass --id for an exact provider record",
+                                    candidate.kind, candidate.value
+                                );
+                                None
+                            }
+                            Err(error) => {
+                                eprintln!("URL resolution needs review: {error:#}");
+                                None
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("could not resolve entry URL: {error:#}");
+                            None
+                        }
+                    }
+                })
+                .context(
+                    "no exact provider id or uniquely resolved DOI; use source plan/resolve, then pass --id",
+                )?;
             let backend = providers::open(&provider_name, mailto.as_deref())?;
             let fetched = backend.lookup(&identifier)?;
-            let provider_source = provenance::provider_source(&fetched);
+            if let Some(candidate) = &resolution_candidate
+                && candidate.kind == "doi"
+                && !candidate.value.eq_ignore_ascii_case(&fetched.record.id)
+            {
+                bail!(
+                    "resolved DOI {} does not match provider record id {}",
+                    candidate.value,
+                    fetched.record.id
+                );
+            }
+            let resolution_source = resolution_candidate
+                .as_ref()
+                .map(provenance::resolution_source)
+                .transpose()?;
+            let provider_source = provenance::provider_source_with_resolution(
+                &fetched,
+                resolution_source
+                    .as_ref()
+                    .map(|source| source.entry_key.as_str()),
+            );
             let mut fields = fetched.record.bibtex_fields();
             fields.insert(SOURCE_FIELD.to_owned(), provider_source.entry_key.clone());
             let output = update_entry_fields_exact(
@@ -543,8 +707,14 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             )?;
             let records_after_fields = parse(&output)
                 .context("provider update produced invalid BibTeX; file was not changed")?;
-            let mut output =
-                provenance::append_source(&output, &provider_source, &records_after_fields)?;
+            let mut output = output;
+            let mut records_after_sources = records_after_fields;
+            if let Some(resolution_source) = &resolution_source {
+                output =
+                    provenance::append_source(&output, resolution_source, &records_after_sources)?;
+                records_after_sources = parse(&output)?;
+            }
+            output = provenance::append_source(&output, &provider_source, &records_after_sources)?;
             if add_integrity {
                 let records = parse(&output)?;
                 output = update_source(&output, &records, &BTreeSet::from([key.clone()]), false)?;
@@ -552,7 +722,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             if in_place {
                 atomic_write(&file, &output)?;
                 eprintln!(
-                    "updated {key} from {provider_name}:{} in {}; raw response recorded as {}{}",
+                    "updated {key} from {provider_name}:{} in {}; receipt recorded as {}{}",
                     fetched.record.id,
                     file.display(),
                     provider_source.entry_key,
@@ -567,18 +737,31 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             }
             Ok(0)
         }
-        SourceCommand::Raw { file, key } => {
+        SourceCommand::Trace { file, key, compact } => {
             let source = read_file(&file)?;
             let records = parse(&source)?;
             let record = records
                 .iter()
                 .find(|record| !record.is_provenance() && record.entry_key == key)
                 .with_context(|| format!("citation key not found: {key}"))?;
-            let response = provenance::raw_response(record, &records)
+            let trace = provenance::trace(record, &records)
                 .with_context(|| format!("provider evidence for {key} is not valid"))?;
-            io::stdout()
-                .write_all(&response)
-                .context("could not write provider response to stdout")?;
+            print_serializable(&trace, compact)?;
+            Ok(0)
+        }
+        SourceCommand::StripResponses { file, in_place } => {
+            let source = read_file(&file)?;
+            let (output, removed) =
+                remove_entry_type_fields(&source, SOURCE_TYPE, &["response", "responseencoding"])?;
+            if in_place {
+                atomic_write(&file, &output)?;
+                eprintln!(
+                    "removed {removed} legacy response field(s) from {}",
+                    file.display()
+                );
+            } else {
+                print!("{output}");
+            }
             Ok(0)
         }
     }

@@ -67,7 +67,8 @@ fn source_help_explains_provider_and_review_workflow() {
         .stdout(
             predicate::str::contains("bib source plan refs.bib")
                 .and(predicate::str::contains("@bibsource"))
-                .and(predicate::str::contains("exact base64-encoded response"))
+                .and(predicate::str::contains("never embeds response"))
+                .and(predicate::str::contains("bib source trace"))
                 .and(predicate::str::contains("bib integrity add refs.bib")),
         );
 }
@@ -401,7 +402,7 @@ fn explicit_empty_keys_pipeline_is_rejected() {
 }
 
 #[test]
-fn crossref_pipeline_records_raw_response_and_adds_valid_integrity() {
+fn crossref_pipeline_records_compact_receipt_and_adds_valid_integrity() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("references.bib");
     fs::write(
@@ -426,7 +427,9 @@ fn crossref_pipeline_records_raw_response_and_adds_valid_integrity() {
     assert!(output.contains("provider = {crossref}"));
     assert!(output.contains("mediatype = {application/vnd.crossref-api-message+json}"));
     assert!(output.contains("responsesha256 = {"));
-    assert!(output.contains("responseencoding = {base64}"));
+    assert!(output.contains("projectionsha256 = {"));
+    assert!(!output.contains("responseencoding ="));
+    assert!(!output.contains("response ="));
     assert!(!output.contains("volume = {stale}"));
     assert!(!output.contains("pages = {1--2}"));
     let parsed = bib_cli::bibtex::parse(&output).unwrap();
@@ -443,16 +446,26 @@ fn crossref_pipeline_records_raw_response_and_adds_valid_integrity() {
         .success()
         .stdout("verified\tpaper1\tprovider\n");
 
-    Command::cargo_bin("bib")
+    let trace = Command::cargo_bin("bib")
         .unwrap()
-        .args(["source", "raw"])
+        .args(["source", "trace"])
         .arg(&path)
-        .args(["--key", "paper1"])
+        .args(["--key", "paper1", "--compact"])
         .assert()
         .success()
-        .stdout(body);
+        .get_output()
+        .stdout
+        .clone();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    assert_eq!(trace["target"], "paper1");
+    assert_eq!(trace["provider"]["fields"]["provider"], "crossref");
+    assert!(trace["provider"]["fields"].get("response").is_none());
 
-    fs::write(&path, output.replace("response = {", "response = {WA==")).unwrap();
+    fs::write(
+        &path,
+        output.replace("projectionsha256 = {", "projectionsha256 = {0"),
+    )
+    .unwrap();
     Command::cargo_bin("bib")
         .unwrap()
         .args(["integrity", "status"])
@@ -460,6 +473,168 @@ fn crossref_pipeline_records_raw_response_and_adds_valid_integrity() {
         .assert()
         .code(3)
         .stdout("invalid\tpaper1\tprovider\n");
+}
+
+#[test]
+fn resolves_doi_url_without_network_access() {
+    let output = Command::cargo_bin("bib")
+        .unwrap()
+        .args([
+            "source",
+            "resolve",
+            "https://publisher.example/article/10.1234/Example",
+            "--compact",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["status"], "resolved");
+    assert_eq!(report["candidates"][0]["kind"], "doi");
+    assert_eq!(report["candidates"][0]["value"], "10.1234/example");
+    assert_eq!(report["candidates"][0]["evidence"]["method"], "url-doi");
+}
+
+#[test]
+fn strip_responses_migrates_legacy_evidence_without_reformatting() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "% keep\n@bibsource{receipt, kind={provider}, responseencoding={base64}, response={WA==}, responsesha256={abc}}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["source", "strip-responses"])
+        .arg(&path)
+        .arg("--in-place")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("removed 2 legacy response field"));
+
+    let output = fs::read_to_string(path).unwrap();
+    assert!(output.starts_with("% keep\n@bibsource"));
+    assert!(!output.contains("responseencoding"));
+    assert!(!output.contains("response={"));
+    assert!(output.contains("responsesha256={abc}"));
+}
+
+#[test]
+fn apply_resolves_entry_url_and_records_linked_receipts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{paper1, url={https://doi.org/10.1234/Example}, note={local}}\n",
+    )
+    .unwrap();
+    let body = r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Resolved title"],"issued":{"date-parts":[[2026]]}}}"#;
+    let base_url = mock_crossref(body);
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args(["--key", "paper1", "--add-integrity", "--in-place"])
+        .assert()
+        .success();
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(output.contains("kind = {resolution}"));
+    assert!(output.contains("method = {url-doi}"));
+    assert!(output.contains("identifier = {10.1234/example}"));
+    assert!(output.contains("resolution = {bibsource:resolution:"));
+    assert!(output.contains("projectionsha256 = {"));
+    assert!(!output.contains("responseencoding ="));
+    assert!(!output.contains("response ="));
+
+    let trace = Command::cargo_bin("bib")
+        .unwrap()
+        .args(["source", "trace"])
+        .arg(&path)
+        .args(["--key", "paper1", "--compact"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    assert_eq!(trace["resolution"]["fields"]["method"], "url-doi");
+    assert_eq!(
+        trace["resolution"]["fields"]["identifier"],
+        "10.1234/example"
+    );
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(path)
+        .assert()
+        .success()
+        .stdout("verified\tpaper1\tprovider\n");
+}
+
+#[test]
+fn plan_resolves_entry_url_before_exact_provider_lookup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{paper1, url={https://doi.org/10.1234/Example}}\n",
+    )
+    .unwrap();
+    let base_url = mock_crossref(
+        r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Resolved title"]}}"#,
+    );
+
+    let output = Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "plan"])
+        .arg(&path)
+        .args(["--key", "paper1", "--compact"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(rows[0]["status"], "resolved-exact");
+    assert_eq!(
+        rows[0]["resolution"]["candidates"][0]["value"],
+        "10.1234/example"
+    );
+    assert_eq!(rows[0]["candidates"][0]["record"]["id"], "10.1234/example");
+}
+
+#[test]
+fn apply_rejects_provider_record_that_disagrees_with_resolved_doi() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    let original = "@article{paper1, url={https://doi.org/10.1234/Expected}}\n";
+    fs::write(&path, original).unwrap();
+    let base_url = mock_crossref(
+        r#"{"message":{"DOI":"10.1234/different","type":"journal-article","title":["Wrong record"]}}"#,
+    );
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args(["--key", "paper1", "--add-integrity", "--in-place"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "does not match provider record id",
+        ));
+
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]

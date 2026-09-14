@@ -4,3 +4,4 @@ pub mod inspect;
 pub mod integrity;
 pub mod provenance;
 pub mod providers;
+pub mod resolver;

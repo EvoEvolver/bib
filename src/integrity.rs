@@ -202,6 +202,39 @@ pub fn update_entry_fields_exact(
     update_entry_fields_impl(source, key, entry_type, fields, controlled_fields)
 }
 
+pub fn remove_entry_type_fields(
+    source: &str,
+    entry_type: &str,
+    field_names: &[&str],
+) -> Result<(String, usize)> {
+    let spans = scan_entries(source)?;
+    let mut edits = Vec::new();
+    for entry in spans
+        .iter()
+        .filter(|entry| source[entry.type_start..entry.type_end].eq_ignore_ascii_case(entry_type))
+    {
+        for field in &entry.fields {
+            if field_names
+                .iter()
+                .any(|name| field.name.eq_ignore_ascii_case(name))
+            {
+                edits.push(Edit {
+                    start: field.segment_start,
+                    end: field.remove_end,
+                    replacement: String::new(),
+                });
+            }
+        }
+    }
+    let removed = edits.len();
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
+    let mut output = source.to_owned();
+    for edit in edits {
+        output.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    Ok((output, removed))
+}
+
 fn update_entry_fields_impl(
     source: &str,
     key: &str,
@@ -578,5 +611,25 @@ mod tests {
         assert!(output.contains("title = {Replacement}"));
         assert!(output.contains("doi = {10.1/example}"));
         assert!(output.contains("@misc(Two"));
+    }
+
+    #[test]
+    fn removes_legacy_response_fields_without_reformatting() {
+        let source = r#"% keep
+@bibsource{receipt,
+  kind = {provider},
+  responseencoding = {base64},
+  response = {eyJ0ZXN0Ijp0cnVlfQ==},
+  responsesha256 = {abc},
+}
+"#;
+        let (output, removed) =
+            remove_entry_type_fields(source, "bibsource", &["response", "responseencoding"])
+                .unwrap();
+        assert_eq!(removed, 2);
+        assert!(output.starts_with("% keep\n@bibsource"));
+        assert!(!output.contains("responseencoding"));
+        assert!(!output.contains("response ="));
+        assert!(output.contains("responsesha256 = {abc}"));
     }
 }

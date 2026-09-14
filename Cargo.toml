@@ -1,6 +1,6 @@
 [package]
 name = "bib-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A provider-neutral BibTeX reconciliation CLI with reviewable integrity markers"
 license = "MIT"
@@ -12,10 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
+percent-encoding = "2.3"
 quick-xml = "0.38"
+regex = "1.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+scraper = "0.27"
 serde = { version = "1.0", features = ["derive"] }
 serde_bibtex = "0.7"
 serde_json = { version = "1.0", features = ["preserve_order"] }
