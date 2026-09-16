@@ -1,13 +1,18 @@
 # bib
 
-`bib` is a Rust CLI for reconciling BibTeX with literature metadata providers,
-inspecting entries as JSON, and attaching source-bound integrity markers. Every
-integrity marker references a separate `@bibsource` provenance entry. Crossref is
-the default metadata backend; DOI content negotiation is also built in.
+`bib` is a review-first CLI for BibTeX. It finds likely duplicate entries,
+reconciles metadata with literature providers, and attaches source-bound
+integrity markers. It is designed for agent-assisted bibliography maintenance:
+`bib` prepares evidence and candidates; a human or agent decides what to merge
+or approve.
 
-It is designed for a workflow where an agent edits or researches bibliography
-entries, a human reviews the result, and the agent marks only confirmed citation
-keys. Provider results retain compact request, response-hash, and projection-hash
+The command is deliberately non-destructive by default. It never silently picks
+a metadata candidate, merges citation keys, or rewrites arbitrary BibTeX fields.
+Every integrity marker references a separate `@bibsource` provenance entry.
+Crossref is the default metadata backend; DOI content negotiation is also built
+in.
+
+Provider results retain compact request, response-hash, and projection-hash
 receipts; response bodies are never embedded in the bibliography. Agent-created
 records are explicitly labeled as agent assertions instead of looking
 provider-verified.
@@ -52,6 +57,27 @@ bib --version
 selection or transformation.
 
 ## Quick start
+
+### Find duplicates
+
+Compare one or more BibTeX files and emit scored candidate pairs for review:
+
+```sh
+bib dedupe references.bib other-references.bib
+```
+
+The result is JSON. Each pair includes the combined score, title and author
+scores, input files, citation keys, and complete fields:
+
+```sh
+bib dedupe references.bib --compact > duplicate-candidates.json
+```
+
+Exit status is `0` when no pair meets the threshold, `3` when candidates need
+review, and `2` for invalid input. Adjust the threshold with `--min-score`
+(default `0.75`). `bib dedupe` never merges or removes entries.
+
+### Reconcile metadata
 
 Plan metadata replacements for selected entries:
 
@@ -120,16 +146,6 @@ Inspect the review status of every entry:
 bib integrity status references.bib
 ```
 
-Find likely duplicate entries for agent review:
-
-```sh
-bib dedupe references.bib
-```
-
-`dedupe` compares normalized titles and authors, emits scored candidate pairs as
-JSON, and never merges or removes entries itself. It exits with status `3` when
-candidates need review and `0` when none meet the threshold.
-
 List just the citation keys that need attention:
 
 ```sh
@@ -147,6 +163,30 @@ bib integrity add references.bib --key turing1936 \
 This creates `@bibsource{..., kind={agent}, actor={claude-code}, ...}`. A later
 content change makes integrity `stale`; missing, damaged, or inconsistent source
 evidence makes it `invalid`.
+
+## Dedupe
+
+`bib dedupe` is a candidate generator, not a merge engine. It compares every
+pair of bibliography entries that has both `title` and `author` fields. TeX
+commands, braces, punctuation, case, and whitespace are normalized before
+comparison. The combined score is:
+
+```text
+score = 0.7 * title_score + 0.3 * author_score
+```
+
+Author similarity emphasizes family-name overlap and tolerates common BibTeX
+format differences such as `Smith, John` and `John Smith`. Results are sorted by
+score and preserve the complete input fields so an agent can inspect conflicts:
+
+```sh
+bib dedupe references.bib --min-score 0.8 |
+  jq '.[] | {score, entries: [.entries[] | {file, id, title: .fields.title, doi: .fields.doi}]}'
+```
+
+Duplicate citation keys are rejected before scoring, including duplicates across
+input files. This matches the fact that downstream LaTeX tooling cannot resolve
+ambiguous keys.
 
 ## Inspect and pipe
 
