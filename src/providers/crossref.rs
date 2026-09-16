@@ -292,16 +292,24 @@ impl CrossrefContributor {
 #[derive(Default, Deserialize)]
 struct CrossrefDate {
     #[serde(rename = "date-parts", default)]
-    date_parts: Vec<Vec<i32>>,
+    date_parts: Vec<Vec<Option<i32>>>,
 }
 
 impl CrossrefDate {
     fn into_date(self) -> Option<PublicationDate> {
         let parts = self.date_parts.first()?;
         Some(PublicationDate {
-            year: *parts.first()?,
-            month: parts.get(1).and_then(|value| u8::try_from(*value).ok()),
-            day: parts.get(2).and_then(|value| u8::try_from(*value).ok()),
+            year: parts.first().copied().flatten()?,
+            month: parts
+                .get(1)
+                .copied()
+                .flatten()
+                .and_then(|value| u8::try_from(value).ok()),
+            day: parts
+                .get(2)
+                .copied()
+                .flatten()
+                .and_then(|value| u8::try_from(value).ok()),
         })
     }
 }
@@ -359,5 +367,13 @@ mod tests {
     fn normalizes_common_doi_forms() {
         assert_eq!(normalize_doi("https://doi.org/10.1/ABC"), "10.1/ABC");
         assert_eq!(normalize_doi("doi:10.1/ABC"), "10.1/ABC");
+    }
+
+    #[test]
+    fn ignores_crossref_dates_with_null_years() {
+        let work: CrossrefWork =
+            serde_json::from_str(r#"{"DOI":"10.1000/test","issued":{"date-parts":[[null]]}}"#)
+                .unwrap();
+        assert!(work.into_record("crossref").issued.is_none());
     }
 }

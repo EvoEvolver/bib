@@ -35,13 +35,13 @@ Choose another directory or a specific release with environment variables:
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
-  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.6.0 sh
+  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.7.0 sh
 ```
 
 Export the variables first when that reads more clearly:
 
 ```sh
-export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.6.0
+export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.7.0
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
 ```
@@ -78,6 +78,27 @@ review, and `2` for invalid input. Adjust the threshold with `--min-score`
 (default `0.75`). `bib dedupe` never merges or removes entries.
 
 ### Reconcile metadata
+
+Verify a complete bibliography against Crossref and DOI.org, first as a dry run:
+
+```sh
+bib source verify references.bib --all
+```
+
+The JSON report distinguishes exact records that are ready, entries already
+verified by a provider, ambiguous search candidates, and lookup failures. Exact
+DOIs and explicit DOI or arXiv URLs are safe to apply automatically; title and
+author search results are never selected automatically. Commit all successful
+exact matches with one atomic replacement:
+
+```sh
+bib source verify references.bib --all --in-place
+```
+
+The default fallback order is Crossref, then DOI content negotiation. Successful
+entries receive provider provenance and integrity in the same transaction. Exit
+status `3` means at least one entry still needs agent review; successful exact
+matches can still be written when `--in-place` is present.
 
 Plan metadata replacements for selected entries:
 
@@ -255,6 +276,7 @@ Edit bibliography data with the appropriate editor or domain tool. Only
 | `bib inspect [FILE ...]` | Emit bibliography entries and trust state as JSON |
 | `bib dedupe [FILE ...]` | Find title-and-author duplicate candidates for review |
 | `bib source providers` | List installed metadata providers |
+| `bib source verify FILE --all` | Batch exact verification with provider fallback; report ambiguous candidates |
 | `bib source resolve URL` | Resolve a URL into auditable identifier candidates |
 | `bib source search QUERY` | Search a provider and return ranked common records |
 | `bib source plan FILE --key KEY` | Produce candidates and field-level diffs |
@@ -347,9 +369,9 @@ their compact receipt metadata and citation references:
 bib source strip-responses references.bib --in-place
 ```
 
-Use `--all` with `source plan` to generate a review packet for the complete
-bibliography. Applying records remains intentionally key-by-key so candidate
-selection stays explicit.
+Use `source verify --all` for batch exact verification and a review report for
+the complete bibliography. Use `source plan` and key-by-key `source apply` when
+an agent has selected one of several search candidates explicitly.
 
 ## Review workflow
 

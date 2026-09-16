@@ -415,6 +415,14 @@ fn validate_resolution(source: &Record) -> Result<()> {
                 bail!("resolution URL does not contain the recorded identifier");
             }
         }
+        "arxiv-url" => {
+            if required(source, "identifierkind")? != "arxiv"
+                || resolver::arxiv_id_in_url(required(source, "inputurl")?).as_deref()
+                    != Some(required(source, "identifier")?)
+            {
+                bail!("resolution URL does not contain the recorded arXiv identifier");
+            }
+        }
         "html-metadata" | "arxiv-atom" => {
             required(source, "requesturl")?;
             required(source, "finalurl")?;

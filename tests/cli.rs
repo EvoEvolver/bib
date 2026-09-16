@@ -66,7 +66,8 @@ fn source_help_explains_provider_and_review_workflow() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("bib source plan refs.bib")
+            predicate::str::contains("bib source verify refs.bib --all")
+                .and(predicate::str::contains("bib source plan refs.bib"))
                 .and(predicate::str::contains("@bibsource"))
                 .and(predicate::str::contains("never embeds response"))
                 .and(predicate::str::contains("bib source trace"))
@@ -570,6 +571,90 @@ fn crossref_pipeline_records_compact_receipt_and_adds_valid_integrity() {
 }
 
 #[test]
+fn verify_batches_exact_dois_into_one_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{alpha, doi={10.1234/a}}\n@article{beta, doi={10.1234/b}}\n",
+    )
+    .unwrap();
+    let base_url = mock_crossref_many(vec![
+        r#"{"message":{"DOI":"10.1234/a","type":"journal-article","title":["Alpha"]}}"#,
+        r#"{"message":{"DOI":"10.1234/b","type":"journal-article","title":["Beta"]}}"#,
+    ]);
+
+    let output = Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", base_url)
+        .args(["source", "verify"])
+        .arg(&path)
+        .args([
+            "--all",
+            "--providers",
+            "crossref",
+            "--in-place",
+            "--compact",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["status"] == "verified")
+    );
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(path)
+        .assert()
+        .success()
+        .stdout("verified\talpha\tprovider\nverified\tbeta\tprovider\n");
+}
+
+#[test]
+fn verify_falls_back_from_crossref_to_doi_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{alpha, url={https://arxiv.org/abs/2401.01234}}\n",
+    )
+    .unwrap();
+    let crossref_url = mock_status_response("404 Not Found", "application/json", "{}");
+    let doi_url = mock_response(
+        "application/x-bibtex",
+        "@article{x, title={Raw DOI title}, doi={10.48550/arXiv.2401.01234}}",
+    );
+
+    let output = Command::cargo_bin("bib")
+        .unwrap()
+        .env("BIB_CROSSREF_API_BASE", crossref_url)
+        .env("BIB_DOI_API_BASE", doi_url)
+        .args(["source", "verify"])
+        .arg(&path)
+        .args(["--all", "--in-place", "--compact"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(rows[0]["provider"], "doi");
+    assert_eq!(rows[0]["status"], "verified");
+    let updated = fs::read_to_string(path).unwrap();
+    assert!(updated.contains("bibprovider = {doi}"));
+    assert!(updated.contains("method = {arxiv-url}"));
+}
+
+#[test]
 fn resolves_doi_url_without_network_access() {
     let output = Command::cargo_bin("bib")
         .unwrap()
@@ -774,7 +859,35 @@ fn mock_crossref(body: &'static str) -> String {
     mock_response("application/json", body)
 }
 
+fn mock_crossref_many(bodies: Vec<&'static str>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for body in bodies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+    });
+    format!("http://{address}/")
+}
+
 fn mock_response(content_type: &'static str, body: &'static str) -> String {
+    mock_status_response("200 OK", content_type, body)
+}
+
+fn mock_status_response(
+    status: &'static str,
+    content_type: &'static str,
+    body: &'static str,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     thread::spawn(move || {
@@ -783,7 +896,7 @@ fn mock_response(content_type: &'static str, body: &'static str) -> String {
         let _ = stream.read(&mut request).unwrap();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )

@@ -124,7 +124,12 @@ pub fn update_source(
                     replacement: value,
                 });
             } else {
-                edits.push(insertion_edit(source, entry, value));
+                edits.push(insertion_edit(
+                    source,
+                    entry,
+                    value,
+                    !entry.fields.is_empty(),
+                ));
             }
         }
     }
@@ -156,6 +161,18 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
+}
+
+pub fn atomic_write_if_unchanged(path: &Path, expected: &str, contents: &str) -> Result<()> {
+    let current = fs::read_to_string(path)
+        .with_context(|| format!("could not reread {} before writing", path.display()))?;
+    if current != expected {
+        bail!(
+            "{} changed since it was read; retry the command",
+            path.display()
+        );
+    }
+    atomic_write(path, contents)
 }
 
 #[derive(Debug)]
@@ -297,7 +314,18 @@ fn update_entry_fields_impl(
     }
 
     if !missing.is_empty() {
-        edits.push(insertion_edit(source, entry, missing.join(",\n")));
+        let has_remaining_fields = entry.fields.iter().any(|field| {
+            !controlled_fields
+                .iter()
+                .any(|name| field.name.eq_ignore_ascii_case(name))
+                || fields.contains_key(&field.name)
+        });
+        edits.push(insertion_edit(
+            source,
+            entry,
+            missing.join(",\n"),
+            has_remaining_fields,
+        ));
     }
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
     let mut output = source.to_owned();
@@ -307,7 +335,12 @@ fn update_entry_fields_impl(
     Ok(output)
 }
 
-fn insertion_edit(source: &str, entry: &EntrySpan, value: String) -> Edit {
+fn insertion_edit(
+    source: &str,
+    entry: &EntrySpan,
+    value: String,
+    has_remaining_fields: bool,
+) -> Edit {
     let bytes = source.as_bytes();
     let mut body_end = entry.close;
     while body_end > entry.open + 1 && bytes[body_end - 1].is_ascii_whitespace() {
@@ -319,7 +352,11 @@ fn insertion_edit(source: &str, entry: &EntrySpan, value: String) -> Edit {
         .first()
         .and_then(|field| line_indent(source, field.trimmed_start))
         .unwrap_or("  ");
-    let prefix = if has_trailing_comma { "" } else { "," };
+    let prefix = if has_trailing_comma || !has_remaining_fields {
+        ""
+    } else {
+        ","
+    };
     let value = value.replace('\n', &format!("\n{indent}"));
     Edit {
         start: body_end,
@@ -614,6 +651,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_update_can_replace_the_only_controlled_field() {
+        let source = "@article{alpha, url={https://arxiv.org/abs/2401.01234}}\n";
+        let fields = BTreeMap::from([
+            ("bibprovider".to_owned(), "doi".to_owned()),
+            (
+                "bibproviderid".to_owned(),
+                "10.48550/arXiv.2401.01234".to_owned(),
+            ),
+            ("bibsource".to_owned(), "bibsource:provider:abc".to_owned()),
+            ("doi".to_owned(), "10.48550/arXiv.2401.01234".to_owned()),
+            ("title".to_owned(), "Raw DOI title".to_owned()),
+        ]);
+        let output = update_entry_fields_exact(
+            source,
+            "alpha",
+            "article",
+            &fields,
+            &["url", "title", "doi", "bibprovider", "bibproviderid"],
+        )
+        .unwrap();
+
+        parse(&output).unwrap_or_else(|error| panic!("{error:#}\n{output}"));
+        assert!(!output.contains("arxiv.org"));
+        assert!(output.contains("doi = {10.48550/arXiv.2401.01234}"));
+    }
+
+    #[test]
     fn removes_legacy_response_fields_without_reformatting() {
         let source = r#"% keep
 @bibsource{receipt,
@@ -631,5 +695,17 @@ mod tests {
         assert!(!output.contains("responseencoding"));
         assert!(!output.contains("response ="));
         assert!(output.contains("responsesha256 = {abc}"));
+    }
+
+    #[test]
+    fn conditional_atomic_write_rejects_a_stale_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("references.bib");
+        fs::write(&path, "original").unwrap();
+        fs::write(&path, "changed elsewhere").unwrap();
+
+        let error = atomic_write_if_unchanged(&path, "original", "our update").unwrap_err();
+        assert!(format!("{error:#}").contains("changed since it was read"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "changed elsewhere");
     }
 }

@@ -153,6 +153,10 @@ pub fn identifiers_in_url(input_url: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+pub fn arxiv_id_in_url(input_url: &str) -> Option<String> {
+    find_arxiv_id(input_url)
+}
+
 fn resolve_arxiv(input_url: &str, arxiv_id: &str) -> Result<ResolutionReport> {
     let mut api_url = Url::parse("https://export.arxiv.org/api/query")?;
     api_url.query_pairs_mut().append_pair("id_list", arxiv_id);
