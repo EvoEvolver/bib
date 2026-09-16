@@ -30,13 +30,13 @@ Choose another directory or a specific release with environment variables:
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
-  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.5.0 sh
+  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.6.0 sh
 ```
 
 Export the variables first when that reads more clearly:
 
 ```sh
-export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.5.0
+export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.6.0
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
 ```
@@ -120,6 +120,16 @@ Inspect the review status of every entry:
 bib integrity status references.bib
 ```
 
+Find likely duplicate entries for agent review:
+
+```sh
+bib dedupe references.bib
+```
+
+`dedupe` compares normalized titles and authors, emits scored candidate pairs as
+JSON, and never merges or removes entries itself. It exits with status `3` when
+candidates need review and `0` when none meet the threshold.
+
 List just the citation keys that need attention:
 
 ```sh
@@ -191,7 +201,8 @@ cat references.bib | bib inspect - | jq -r '.[].fields.doi // empty'
 
 Multiple files are combined into one array. Use `-` as a filename, or omit files,
 to read BibTeX from stdin. `inspect` never modifies input and omits `@bibsource`
-evidence entries from the array.
+evidence entries from the array. Duplicate citation keys, including duplicates
+across input files, are rejected instead of producing ambiguous entries.
 
 There is intentionally no JSON-to-BibTeX conversion or arbitrary metadata editor.
 Edit bibliography data with the appropriate editor or domain tool. Only
@@ -202,6 +213,7 @@ Edit bibliography data with the appropriate editor or domain tool. Only
 | Command | Purpose |
 | --- | --- |
 | `bib inspect [FILE ...]` | Emit bibliography entries and trust state as JSON |
+| `bib dedupe [FILE ...]` | Find title-and-author duplicate candidates for review |
 | `bib source providers` | List installed metadata providers |
 | `bib source resolve URL` | Resolve a URL into auditable identifier candidates |
 | `bib source search QUERY` | Search a provider and return ranked common records |

@@ -1,6 +1,6 @@
 [package]
 name = "bib-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "A provider-neutral BibTeX reconciliation CLI with reviewable integrity markers"
 license = "MIT"

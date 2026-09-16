@@ -10,6 +10,7 @@ use bib_cli::catalog::{
     BibliographicQuery, Candidate, FieldChange, LiteratureIdentifier, LiteratureRecord,
     PROVIDER_FIELD, PROVIDER_ID_FIELD, changes,
 };
+use bib_cli::dedupe::{self, LocatedRecord};
 use bib_cli::inspect;
 use bib_cli::integrity::{
     Status, atomic_write, hash, remove_entry_type_fields, status, update_entry_fields,
@@ -21,7 +22,7 @@ use bib_cli::resolver::{self, ResolutionReport};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-const LONG_ABOUT: &str = "Resolve literature URLs, reconcile BibTeX with pluggable metadata providers, inspect entries as JSON, and add source-bound integrity markers. Provider receipts store response and projection hashes, never response bodies. Every integrity marker references a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
+const LONG_ABOUT: &str = "Resolve literature URLs, reconcile BibTeX with pluggable metadata providers, inspect entries as JSON, find likely duplicates, and add source-bound integrity markers. Provider receipts store response and projection hashes, never response bodies. Every integrity marker references a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
 
 const AFTER_HELP: &str = r#"INSPECT AND PIPE
   Emit bibliography entries and integrity state as one JSON array:
@@ -33,6 +34,13 @@ const AFTER_HELP: &str = r#"INSPECT AND PIPE
   Feed selected citation keys back to a controlled write command:
     bib inspect refs.bib | jq -r '.[].id' |
       bib integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place
+
+DEDUPLICATION
+  Find likely duplicate pairs using normalized title and author similarity:
+    bib dedupe refs.bib
+
+  Results include component scores and complete entry fields for agent review.
+  bib never merges or removes entries automatically.
 
 LITERATURE SOURCES
   Providers map their native metadata into one common literature record. Crossref is
@@ -88,6 +96,25 @@ PIPELINE EXAMPLES
 
 jq is optional and external. bib itself does not evaluate filters or turn edited
 JSON back into BibTeX."#;
+
+const DEDUPE_AFTER_HELP: &str = r#"SCORING
+  Candidate pairs are scored from normalized title and author similarity:
+    score = 0.7 * title_score + 0.3 * author_score
+
+  Author scoring emphasizes family-name overlap while tolerating differences in
+  given-name formatting. TeX braces, commands, punctuation, case, and whitespace
+  are normalized before comparison. Entries missing either title or author are
+  not proposed as candidates.
+
+OUTPUT
+  Emit a JSON array of candidate pairs sorted by descending score. Every entry
+  includes its input file, citation key, type, and fields so an agent can decide
+  whether and how to merge it. bib never merges or removes entries automatically.
+
+EXIT STATUS
+  0  No candidate pairs met the threshold
+  2  Invalid input or operational error
+  3  Candidate pairs were found and need review"#;
 
 const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
   1. Plan replacements and inspect exact matches or ranked candidates:
@@ -162,10 +189,25 @@ struct Cli {
 enum Command {
     /// Emit bibliography entries and their trust state as JSON.
     Inspect(InspectArgs),
+    /// Find likely duplicate entries by title and author similarity.
+    Dedupe(DedupeArgs),
     /// Find and apply records from a literature metadata provider.
     Source(SourceArgs),
     /// Inspect, add, or remove integrity markers.
     Integrity(IntegrityArgs),
+}
+
+#[derive(Args)]
+#[command(after_help = DEDUPE_AFTER_HELP)]
+struct DedupeArgs {
+    /// BibTeX files. Reads stdin when omitted or when FILE is `-`.
+    files: Vec<PathBuf>,
+    /// Minimum combined similarity score from 0 to 1.
+    #[arg(long, default_value_t = 0.75, value_parser = parse_score)]
+    min_score: f64,
+    /// Emit the JSON array on one line.
+    #[arg(short, long)]
+    compact: bool,
 }
 
 #[derive(Args)]
@@ -409,6 +451,13 @@ fn run(cli: Cli) -> Result<u8> {
             let records = read_bib_inputs(&files)?;
             print_serializable(&inspect::document(&records)?, compact)?;
             Ok(0)
+        }
+        Command::Dedupe(args) => {
+            let records = read_bib_inputs_with_origins(&args.files)?;
+            let candidates = dedupe::candidates(&records, args.min_score);
+            let needs_review = !candidates.is_empty();
+            print_serializable(&candidates, args.compact)?;
+            Ok(if needs_review { 3 } else { 0 })
         }
         Command::Source(args) => run_source(args.command),
         Command::Integrity(args) => run_integrity(args.command),
@@ -1049,19 +1098,64 @@ fn merge_keys(mut keys: Vec<String>, keys_from: Option<PathBuf>) -> Result<Vec<S
 }
 
 fn read_bib_inputs(files: &[PathBuf]) -> Result<Vec<Record>> {
+    Ok(read_bib_inputs_with_origins(files)?
+        .into_iter()
+        .map(|item| item.record)
+        .collect())
+}
+
+fn read_bib_inputs_with_origins(files: &[PathBuf]) -> Result<Vec<LocatedRecord>> {
     if files.is_empty() {
-        return parse(&read_stdin("BibTeX")?);
+        return Ok(parse(&read_stdin("BibTeX")?)?
+            .into_iter()
+            .map(|record| LocatedRecord {
+                file: "stdin".to_owned(),
+                record,
+            })
+            .collect());
     }
     let mut records = Vec::new();
+    let mut citation_origins = BTreeMap::new();
     for file in files {
+        let origin = if file == Path::new("-") {
+            "stdin".to_owned()
+        } else {
+            file.display().to_string()
+        };
         let source = if file == Path::new("-") {
             read_stdin("BibTeX")?
         } else {
             read_file(file)?
         };
-        records.extend(parse(&source)?);
+        let parsed = parse(&source)?;
+        for record in &parsed {
+            if record.is_provenance() {
+                continue;
+            }
+            if let Some(previous) =
+                citation_origins.insert(record.entry_key.clone(), origin.clone())
+            {
+                bail!(
+                    "duplicate citation key: {} (found in {previous} and {origin})",
+                    record.entry_key
+                );
+            }
+        }
+        records.extend(parsed.into_iter().map(|record| LocatedRecord {
+            file: origin.clone(),
+            record,
+        }));
     }
     Ok(records)
+}
+
+fn parse_score(value: &str) -> Result<f64, String> {
+    let score = value
+        .parse::<f64>()
+        .map_err(|_| "score must be a number from 0 to 1".to_owned())?;
+    (score.is_finite() && (0.0..=1.0).contains(&score))
+        .then_some(score)
+        .ok_or_else(|| "score must be a number from 0 to 1".to_owned())
 }
 
 fn read_file(path: &Path) -> Result<String> {

@@ -31,6 +31,7 @@ fn top_level_help_documents_inspect_pipe_and_review_workflow() {
         .stdout(
             predicate::str::contains("INSPECT AND PIPE")
                 .and(predicate::str::contains("LITERATURE SOURCES"))
+                .and(predicate::str::contains("DEDUPLICATION"))
                 .and(predicate::str::contains("SCOPE"))
                 .and(predicate::str::contains("INTEGRITY"))
                 .and(predicate::str::contains("EXIT STATUS"))
@@ -156,6 +157,99 @@ fn inspect_emits_pipeline_ready_json_from_stdin() {
     assert_eq!(entries[0]["id"], "alpha");
     assert_eq!(entries[0]["type"], "article");
     assert_eq!(entries[0]["integrity"]["status"], "unverified");
+}
+
+#[test]
+fn inspect_rejects_duplicate_keys_in_one_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{alpha, title={First}}\n@book{alpha, title={Second}}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["inspect"])
+        .arg(&path)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("duplicate citation key: alpha"));
+}
+
+#[test]
+fn inspect_rejects_duplicate_keys_across_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.bib");
+    let second = directory.path().join("second.bib");
+    fs::write(&first, "@article{alpha, title={First}}\n").unwrap();
+    fs::write(&second, "@book{alpha, title={Second}}\n").unwrap();
+
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["inspect"])
+        .arg(&first)
+        .arg(&second)
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("duplicate citation key: alpha")
+                .and(predicate::str::contains(first.display().to_string()))
+                .and(predicate::str::contains(second.display().to_string())),
+        );
+}
+
+#[test]
+fn dedupe_emits_scored_pairs_for_agent_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.bib");
+    let second = directory.path().join("second.bib");
+    fs::write(
+        &first,
+        "@article{smith, title={A Great Paper}, author={Smith, John and Doe, Jane}, year={2025}}\n",
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        "@article{smith-alt, title={A {Great} Paper}, author={John Smith and Jane Doe}, doi={10.1/example}}\n",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("bib")
+        .unwrap()
+        .args(["dedupe"])
+        .arg(&first)
+        .arg(&second)
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let candidates: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(candidates.as_array().unwrap().len(), 1);
+    assert_eq!(candidates[0]["score"], 1.0);
+    assert_eq!(candidates[0]["title_score"], 1.0);
+    assert_eq!(candidates[0]["author_score"], 1.0);
+    assert_eq!(
+        candidates[0]["entries"][0]["file"],
+        first.display().to_string()
+    );
+    assert_eq!(candidates[0]["entries"][0]["id"], "smith");
+    assert_eq!(candidates[0]["entries"][1]["fields"]["doi"], "10.1/example");
+}
+
+#[test]
+fn dedupe_succeeds_with_empty_json_when_no_pairs_match() {
+    Command::cargo_bin("bib")
+        .unwrap()
+        .args(["dedupe", "--compact"])
+        .write_stdin(
+            "@article{one, title={Alpha}, author={Smith, John}}\n@article{two, title={Beta}, author={Jones, Jane}}\n",
+        )
+        .assert()
+        .success()
+        .stdout("[]\n");
 }
 
 #[test]
