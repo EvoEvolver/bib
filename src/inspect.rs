@@ -60,6 +60,6 @@ mod tests {
         let entries = value.as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], "one");
-        assert_eq!(entries[0]["integrity"]["status"], "unverified");
+        assert_eq!(entries[0]["integrity"]["status"], "invalid");
     }
 }

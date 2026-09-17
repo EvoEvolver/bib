@@ -90,10 +90,10 @@ EDIT HISTORY
     biblock history restore refs.bib --revision 8f31c9d0 --in-place
 
 INTEGRITY
-  verified    Stored integrity matches the current covered fields.
+  verified    Valid integrity backed by a provider API or explicit human approval.
+  valid       Integrity and provenance are consistent, but the source is agent or web.
   stale       A marker exists, but the covered fields have changed.
-  unverified  No integrity marker exists.
-  invalid     The marker matches, but provenance is missing, damaged, or inconsistent.
+  invalid     Integrity or provenance is missing, damaged, or inconsistent.
 
   Adding integrity always requires --source provider, --source agent --agent ID,
   or --source human --reviewer ID, plus --key, --keys-from, or --all.
@@ -185,7 +185,13 @@ EXAMPLES
 
 Agent and human modes are attributed assertions, not cryptographic identities.
 Provider mode proves agreement with the stored projection receipt. Receipts are
-tamper-evident workflow metadata, not proof that an API served particular bytes."#;
+tamper-evident workflow metadata, not proof that an API served particular bytes.
+
+STATUS POLICY
+  verified requires a valid provider source or explicit human approval. Valid
+  agent and web evidence is reported as valid, not verified. Missing integrity or
+  provenance is invalid. The status command exits 0 only when every selected
+  entry is verified."#;
 
 const RESOLVE_AFTER_HELP: &str = r#"SIGNALS
   DOI text in the input or final URL is exact. Publisher citation metadata and

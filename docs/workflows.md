@@ -168,7 +168,8 @@ biblock integrity remove references.bib --key paper1 --in-place
 
 ## CI
 
-Commit the bibliography and lockfile, then fail CI if they diverge:
+Commit the bibliography and lockfile, then fail CI if they diverge or any entry
+lacks an exact provider API source or explicit human approval:
 
 ```sh
 biblock lock references.bib --frozen
@@ -176,9 +177,14 @@ biblock integrity status references.bib
 ```
 
 `integrity status` exits `0` when every selected entry is verified, `3` when any
-entry is stale, unverified, or invalid, and `2` for invalid input or an
+entry is valid but not verified, stale, or invalid, and `2` for invalid input or an
 operational error. Review-producing commands also use exit status `3` when human
 or agent judgment is required.
+
+`verified` requires valid integrity whose direct source is `provider` or `human`.
+An internally consistent `agent` or `web` source is `valid`, but does not satisfy
+the release gate. Missing integrity or provenance is `invalid`; a later content
+change is `stale`.
 
 ## Command index
 

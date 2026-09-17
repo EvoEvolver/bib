@@ -18,8 +18,8 @@ pub const PREVIOUS_FIELD: &str = "bibprevious";
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Verified,
+    Valid,
     Stale,
-    Unverified,
     Invalid,
 }
 
@@ -27,8 +27,8 @@ impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Verified => f.write_str("verified"),
+            Self::Valid => f.write_str("valid"),
             Self::Stale => f.write_str("stale"),
-            Self::Unverified => f.write_str("unverified"),
             Self::Invalid => f.write_str("invalid"),
         }
     }
@@ -72,12 +72,12 @@ pub fn content_hash(record: &Record) -> Result<String> {
 
 pub fn status(record: &Record, records: &[Record]) -> Result<Status> {
     match record.fields.get(FIELD).map(|value| value.trim()) {
-        None | Some("") => Ok(Status::Unverified),
+        None | Some("") => Ok(Status::Invalid),
         Some(stored) if stored == hash(record)? => {
-            Ok(if provenance::validate(record, records).is_ok() {
-                Status::Verified
-            } else {
-                Status::Invalid
+            Ok(match provenance::validate(record, records) {
+                Ok("provider" | "human") => Status::Verified,
+                Ok(_) => Status::Valid,
+                Err(_) => Status::Invalid,
             })
         }
         Some(_) => Ok(Status::Stale),
@@ -660,10 +660,7 @@ mod tests {
         assert!(added.contains("integrity = {"));
         assert!(added.contains("@bibsource"));
         let records = parse(&added).unwrap();
-        assert!(matches!(
-            status(&records[0], &records),
-            Ok(Status::Verified)
-        ));
+        assert!(matches!(status(&records[0], &records), Ok(Status::Valid)));
 
         let removed = update_source(&added, &records, &selected, true).unwrap();
         assert!(!removed.contains("integrity ="));
@@ -727,7 +724,7 @@ mod tests {
         let source = "@misc(Key, title={A title (revised)}, note={contains ) safely})\n";
         let added = add_agent_integrity(source, "Key");
         let records = parse(&added).unwrap();
-        assert_eq!(status(&records[0], &records).unwrap(), Status::Verified);
+        assert_eq!(status(&records[0], &records).unwrap(), Status::Valid);
     }
 
     #[test]

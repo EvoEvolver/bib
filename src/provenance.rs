@@ -377,7 +377,7 @@ pub fn append_source(source: &str, record: &Record, records: &[Record]) -> Resul
     ))
 }
 
-pub fn validate(record: &Record, records: &[Record]) -> Result<()> {
+pub fn validate<'a>(record: &Record, records: &'a [Record]) -> Result<&'a str> {
     let source_key = record
         .fields
         .get(SOURCE_FIELD)
@@ -387,16 +387,18 @@ pub fn validate(record: &Record, records: &[Record]) -> Result<()> {
         .iter()
         .find(|candidate| candidate.is_provenance() && candidate.entry_key == *source_key)
         .with_context(|| format!("referenced provenance entry not found: {source_key}"))?;
-    match required(source, "kind")? {
-        "provider" => validate_provider(record, source, records),
-        "agent" => validate_actor(record, source, "agent"),
-        "human" => validate_actor(record, source, "human"),
-        "web" => validate_web(record, source),
+    let kind = required(source, "kind")?;
+    match kind {
+        "provider" => validate_provider(record, source, records)?,
+        "agent" => validate_actor(record, source, "agent")?,
+        "human" => validate_actor(record, source, "human")?,
+        "web" => validate_web(record, source)?,
         "resolution" | "search" | "selection" => {
             bail!("supporting evidence cannot directly verify a BibTeX entry")
         }
         other => bail!("unknown provenance kind {other:?}"),
     }
+    Ok(kind)
 }
 
 fn validate_web(record: &Record, source: &Record) -> Result<()> {

@@ -26,7 +26,7 @@ Its top-level sections are:
 ```json
 {
   "lockfileVersion": "1.0",
-  "toolVersion": "0.9.0",
+  "toolVersion": "0.10.0",
   "bibliography": { "contentHash": "..." },
   "entries": {
     "turing1936": {
@@ -122,10 +122,10 @@ Integrity states are:
 
 | State | Meaning |
 | --- | --- |
-| `verified` | Stored integrity and its source validate against current content |
+| `verified` | Integrity is valid and backed by a provider API or explicit human approval |
+| `valid` | Integrity and provenance are consistent, but backed only by agent or web evidence |
 | `stale` | An integrity record exists, but covered content changed |
-| `unverified` | No integrity approval exists |
-| `invalid` | The content hash matches, but source evidence is missing or inconsistent |
+| `invalid` | Integrity or source history is missing or inconsistent |
 
 ## Evidence chains
 

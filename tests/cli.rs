@@ -173,7 +173,7 @@ fn inspect_emits_pipeline_ready_json_from_stdin() {
     assert_eq!(entries.as_array().unwrap().len(), 2);
     assert_eq!(entries[0]["id"], "alpha");
     assert_eq!(entries[0]["type"], "article");
-    assert_eq!(entries[0]["integrity"]["status"], "unverified");
+    assert_eq!(entries[0]["integrity"]["status"], "invalid");
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .args(["--key", "alpha"])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("unverified\talpha"));
+        .stdout(predicate::str::contains("invalid\talpha"));
 
     Command::cargo_bin("biblock")
         .unwrap()
@@ -308,8 +308,8 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .arg(&path)
         .args(["--key", "alpha"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("verified\talpha"));
+        .code(3)
+        .stdout(predicate::str::contains("valid\talpha"));
 
     fs::write(
         &path,
@@ -324,6 +324,97 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .assert()
         .code(3)
         .stdout("stale\talpha\tagent\n");
+}
+
+#[test]
+fn integrity_status_reserves_verified_for_provider_or_human_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+    let base_url = mock_crossref(
+        r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Alpha"],"issued":{"date-parts":[[2026]]}}}"#,
+    );
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--id",
+            "10.1234/example",
+            "--add-integrity",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "beta",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["id"], "alpha");
+    assert_eq!(rows[0]["status"], "verified");
+    assert_eq!(rows[0]["source"]["kind"], "provider");
+    assert_eq!(rows[1]["id"], "beta");
+    assert_eq!(rows[1]["status"], "valid");
+    assert_eq!(rows[1]["source"]["kind"], "agent");
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "beta",
+            "--source",
+            "human",
+            "--reviewer",
+            "alice",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["status"] == "verified")
+    );
+    assert_eq!(rows[1]["source"]["kind"], "human");
 }
 
 #[test]
@@ -387,8 +478,8 @@ fn in_place_edits_create_a_valid_history_chain() {
         .arg(&path)
         .args(["--key", "alpha"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("verified\talpha"));
+        .code(3)
+        .stdout(predicate::str::contains("valid\talpha"));
 
     Command::cargo_bin("biblock")
         .unwrap()
@@ -574,7 +665,7 @@ fn json_lockfile_supports_sync_frozen_and_external_edits() {
 
     let lock = read_lock(&path);
     assert_eq!(lock["lockfileVersion"], "1.0");
-    assert_eq!(lock["toolVersion"], "0.9.0");
+    assert_eq!(lock["toolVersion"], "0.10.0");
     assert!(lock["bibliography"]["contentHash"].is_string());
     assert!(lock["entries"]["alpha"]["contentHash"].is_string());
     assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);
@@ -671,8 +762,8 @@ fn sync_migrates_legacy_embedded_workflow_state() {
         .args(["integrity", "status"])
         .arg(&path)
         .assert()
-        .success()
-        .stdout("verified\talpha\tagent\n");
+        .code(3)
+        .stdout("valid\talpha\tagent\n");
 
     fs::remove_file(lock_path(&path)).unwrap();
     Command::cargo_bin("biblock")
@@ -681,7 +772,7 @@ fn sync_migrates_legacy_embedded_workflow_state() {
         .arg(&path)
         .assert()
         .code(3)
-        .stdout("unverified\talpha\n");
+        .stdout("invalid\talpha\n");
 }
 
 #[test]
@@ -752,8 +843,8 @@ fn agent_integrity_creates_attributed_source_entry() {
         .arg(&path)
         .args(["--key", "alpha"])
         .assert()
-        .success()
-        .stdout("verified\talpha\tagent\n");
+        .code(3)
+        .stdout("valid\talpha\tagent\n");
 
     let inspected = Command::cargo_bin("biblock")
         .unwrap()
@@ -814,8 +905,8 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
         .args(["--keys-from", "-"])
         .write_stdin("alpha\n")
         .assert()
-        .success()
-        .stdout("verified\talpha\tagent\n");
+        .code(3)
+        .stdout("valid\talpha\tagent\n");
 
     Command::cargo_bin("biblock")
         .unwrap()
@@ -824,7 +915,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
         .args(["--key", "beta"])
         .assert()
         .code(3)
-        .stdout("unverified\tbeta\n");
+        .stdout("invalid\tbeta\n");
 
     let keys_path = directory.path().join("approved.keys");
     fs::write(&keys_path, "alpha\n").unwrap();
@@ -844,7 +935,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
         .args(["--key", "alpha"])
         .assert()
         .code(3)
-        .stdout("unverified\talpha\tagent\n");
+        .stdout("invalid\talpha\tagent\n");
 }
 
 #[test]

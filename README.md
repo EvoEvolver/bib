@@ -71,7 +71,7 @@ biblock --version
 
 ### Prebuilt releases
 
-Releases from `v0.9.0` onward provide binaries for Linux x86_64/ARM64 and macOS
+Releases from `v0.10.0` onward provide binaries for Linux x86_64/ARM64 and macOS
 Intel/Apple Silicon. The installer verifies the downloaded SHA-256 checksum:
 
 ```sh
@@ -80,7 +80,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 ```
 
 Set `BIBLOCK_INSTALL_DIR` to choose the destination or `BIBLOCK_VERSION` to pin a
-release. The default destination is `~/.local/bin`. Until the first `v0.9.0`
+release. The default destination is `~/.local/bin`. Until the first `v0.10.0`
 release is tagged, install the current main branch from source instead.
 
 ## Five-minute workflow
@@ -135,6 +135,11 @@ biblock integrity status references.bib
 biblock lock references.bib --frozen
 ```
 
+`integrity status` is the release gate: `verified` means the current content and
+evidence chain are valid and the direct source is either an exact provider receipt
+or an explicit human approval. Agent assertions and web receipts are `valid`, but
+still require human approval.
+
 ## Designed for agent review
 
 `biblock` separates proposing a change from trusting it. An agent can inspect,
@@ -147,7 +152,7 @@ can operate on a narrow reviewed set:
 
 ```sh
 biblock inspect references.bib |
-  jq -r '.[] | select(.integrity.status == "unverified") | .id' |
+  jq -r '.[] | select(.integrity.status == "invalid" and .integrity.source.key == null) | .id' |
   biblock integrity add references.bib --keys-from - \
     --source agent --agent codex --in-place
 ```
@@ -165,7 +170,7 @@ presented as provider verification or cryptographic identity.
 | `biblock source plan FILE --key KEY` | Show candidates and field-level changes |
 | `biblock source apply FILE --key KEY` | Apply one explicit provider record |
 | `biblock source trace FILE --key KEY` | Show the evidence chain for an entry |
-| `biblock integrity status FILE` | Report verified, stale, unverified, or invalid entries |
+| `biblock integrity status FILE` | Require API verification or explicit human approval for every entry |
 | `biblock lock FILE --frozen` | Fail if the lockfile is missing or out of sync |
 | `biblock history log FILE --key KEY` | Show an entry's recorded revisions |
 | `biblock history restore FILE --revision REV` | Restore a prior snapshot as a new edit |
