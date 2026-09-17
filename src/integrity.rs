@@ -13,6 +13,22 @@ use crate::provenance;
 
 pub const FIELD: &str = "integrity";
 pub const PREVIOUS_FIELD: &str = "bibprevious";
+pub const APPROVAL_ID_FIELD: &str = "bibapprovalid";
+pub const APPROVAL_KIND_FIELD: &str = "bibapprovalkind";
+pub const APPROVAL_METHOD_FIELD: &str = "bibapprovalmethod";
+pub const APPROVAL_REVIEWER_FIELD: &str = "bibapprovalreviewer";
+pub const APPROVAL_CONTENT_FIELD: &str = "bibapprovalcontent";
+pub const APPROVAL_TIMESTAMP_FIELD: &str = "bibapprovaltimestamp";
+pub const APPROVAL_BATCH_FIELD: &str = "bibapprovalbatch";
+pub const APPROVAL_FIELDS: &[&str] = &[
+    APPROVAL_ID_FIELD,
+    APPROVAL_KIND_FIELD,
+    APPROVAL_METHOD_FIELD,
+    APPROVAL_REVIEWER_FIELD,
+    APPROVAL_CONTENT_FIELD,
+    APPROVAL_TIMESTAMP_FIELD,
+    APPROVAL_BATCH_FIELD,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,7 +60,18 @@ pub fn canonical_json(record: &Record) -> Result<String> {
             .filter(|(key, _)| {
                 !matches!(
                     key.to_ascii_lowercase().as_str(),
-                    FIELD | PREVIOUS_FIELD | "bibsource" | "bibprovider" | "bibproviderid"
+                    FIELD
+                        | PREVIOUS_FIELD
+                        | "bibsource"
+                        | "bibprovider"
+                        | "bibproviderid"
+                        | APPROVAL_ID_FIELD
+                        | APPROVAL_KIND_FIELD
+                        | APPROVAL_METHOD_FIELD
+                        | APPROVAL_REVIEWER_FIELD
+                        | APPROVAL_CONTENT_FIELD
+                        | APPROVAL_TIMESTAMP_FIELD
+                        | APPROVAL_BATCH_FIELD
                 )
             })
             .map(|(key, value)| (key.to_ascii_lowercase(), value.clone())),
@@ -63,6 +90,28 @@ pub fn hash(record: &Record) -> Result<String> {
     Ok(format!("{digest:x}"))
 }
 
+pub fn approval_id(
+    kind: &str,
+    method: &str,
+    reviewer: Option<&str>,
+    target: &str,
+    content_hash: &str,
+    timestamp: u64,
+    batch_id: &str,
+) -> String {
+    let payload = serde_json::to_vec(&(
+        kind,
+        method,
+        reviewer,
+        target,
+        content_hash,
+        timestamp,
+        batch_id,
+    ))
+    .unwrap_or_default();
+    format!("{:x}", Sha256::digest(payload))
+}
+
 pub fn content_hash(record: &Record) -> Result<String> {
     let mut snapshot = record.clone();
     snapshot.fields.remove(FIELD);
@@ -71,6 +120,39 @@ pub fn content_hash(record: &Record) -> Result<String> {
 }
 
 pub fn status(record: &Record, records: &[Record]) -> Result<Status> {
+    let approval_values = APPROVAL_FIELDS
+        .iter()
+        .filter_map(|field| record.fields.get(*field))
+        .count();
+    if approval_values > 0 {
+        let required = |field| record.fields.get(field).map(String::as_str);
+        let timestamp = required(APPROVAL_TIMESTAMP_FIELD).and_then(|value| value.parse().ok());
+        if required(APPROVAL_KIND_FIELD) != Some("human")
+            || required(APPROVAL_METHOD_FIELD) != Some("browser-review")
+            || required(APPROVAL_ID_FIELD).is_none()
+            || required(APPROVAL_CONTENT_FIELD).is_none()
+            || timestamp.is_none()
+            || required(APPROVAL_BATCH_FIELD).is_none()
+        {
+            return Ok(Status::Invalid);
+        }
+        let expected_id = approval_id(
+            "human",
+            "browser-review",
+            required(APPROVAL_REVIEWER_FIELD),
+            &record.entry_key,
+            required(APPROVAL_CONTENT_FIELD).unwrap_or_default(),
+            timestamp.unwrap_or_default(),
+            required(APPROVAL_BATCH_FIELD).unwrap_or_default(),
+        );
+        if required(APPROVAL_ID_FIELD) != Some(expected_id.as_str()) {
+            return Ok(Status::Invalid);
+        }
+        if record.fields.get(APPROVAL_CONTENT_FIELD) == Some(&hash(record)?) {
+            return Ok(Status::Verified);
+        }
+        return Ok(Status::Stale);
+    }
     match record.fields.get(FIELD).map(|value| value.trim()) {
         None | Some("") => Ok(Status::Invalid),
         Some(stored) if stored == hash(record)? => {

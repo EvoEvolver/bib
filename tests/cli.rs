@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use assert_cmd::Command;
+use biblock_cli::history;
 use predicates::prelude::*;
 
 const SAMPLE: &str = r#"% retained comment
@@ -22,6 +23,64 @@ const SAMPLE: &str = r#"% retained comment
   year = {2025},
 }
 "#;
+
+#[test]
+fn browser_approval_is_content_bound_and_preserves_clean_bibtex() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, "@article{one, title={One}, year={2026}}\n").unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(
+        &file,
+        &BTreeSet::from(["one".to_owned()]),
+        Some("reviewer label"),
+    )
+    .unwrap();
+
+    let clean = fs::read_to_string(&file).unwrap();
+    assert!(!clean.contains("bibapproval"));
+    let lock = read_lock(&file);
+    assert_eq!(lock["entries"]["one"]["approval"]["kind"], "human");
+    assert_eq!(
+        lock["entries"]["one"]["approval"]["reviewer"],
+        "reviewer label"
+    );
+    assert_eq!(lock["revisions"].as_object().unwrap().len(), 1);
+
+    let hydrated = history::hydrate_file(&file).unwrap();
+    let records = biblock_cli::bibtex::parse(&hydrated).unwrap();
+    assert_eq!(
+        biblock_cli::integrity::status(&records[0], &records).unwrap(),
+        biblock_cli::integrity::Status::Verified
+    );
+
+    fs::write(&file, clean.replace("One", "Changed")).unwrap();
+    let hydrated = history::hydrate_file(&file).unwrap();
+    let records = biblock_cli::bibtex::parse(&hydrated).unwrap();
+    assert_eq!(
+        biblock_cli::integrity::status(&records[0], &records).unwrap(),
+        biblock_cli::integrity::Status::Stale
+    );
+}
+
+#[test]
+fn blank_browser_reviewer_is_allowed_and_integrity_remove_clears_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, "@article{one, title={One}}\n").unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(&file, &BTreeSet::from(["one".to_owned()]), Some("   ")).unwrap();
+    assert!(read_lock(&file)["entries"]["one"]["approval"]["reviewer"].is_null());
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "remove"])
+        .arg(&file)
+        .args(["--all", "--in-place"])
+        .assert()
+        .success();
+    assert!(read_lock(&file)["entries"]["one"]["approval"].is_null());
+}
 
 fn lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(

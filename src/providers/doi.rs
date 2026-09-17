@@ -78,6 +78,8 @@ impl LiteratureProvider for DoiProvider {
             request_url: url.to_string(),
             media_type,
             response: bytes,
+            request_method: "GET".to_owned(),
+            request_body_sha256: None,
         })
     }
 

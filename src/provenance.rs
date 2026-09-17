@@ -143,6 +143,8 @@ pub fn provider_source_with_evidence(
         provider: &fetched.record.provider,
         provider_id: &fetched.record.id,
         request_url: &fetched.request_url,
+        request_method: Some(&fetched.request_method),
+        request_body_sha256: fetched.request_body_sha256.as_deref(),
         media_type: &fetched.media_type,
         projection,
         tool_version,
@@ -157,12 +159,16 @@ pub fn provider_source_with_evidence(
         ("provider".to_owned(), fetched.record.provider.clone()),
         ("providerid".to_owned(), fetched.record.id.clone()),
         ("requesturl".to_owned(), fetched.request_url.clone()),
+        ("requestmethod".to_owned(), fetched.request_method.clone()),
         ("mediatype".to_owned(), fetched.media_type.clone()),
         ("projection".to_owned(), projection.to_owned()),
         ("projectionsha256".to_owned(), projection_sha256),
         ("responsesha256".to_owned(), response_sha256),
         ("toolversion".to_owned(), tool_version.to_owned()),
     ]);
+    if let Some(request_body_sha256) = &fetched.request_body_sha256 {
+        fields.insert("requestbodysha256".to_owned(), request_body_sha256.clone());
+    }
     if let Some(resolution_key) = resolution_key {
         fields.insert("resolution".to_owned(), resolution_key.to_owned());
     }
@@ -226,6 +232,24 @@ pub fn search_source(
 }
 
 pub fn selection_source(search: &Record, selected_id: &str, selected_by: &str) -> Result<Record> {
+    selection_source_with_match(search, selected_id, selected_by, "agent-review", None)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MatchEvidence {
+    pub score: f64,
+    pub title_score: f64,
+    pub author_score: f64,
+    pub threshold: f64,
+}
+
+pub fn selection_source_with_match(
+    search: &Record,
+    selected_id: &str,
+    selected_by: &str,
+    method: &str,
+    matched: Option<MatchEvidence>,
+) -> Result<Record> {
     let selected_by = selected_by.trim();
     if selected_by.is_empty() {
         bail!("selection actor cannot be empty");
@@ -241,12 +265,19 @@ pub fn selection_source(search: &Record, selected_id: &str, selected_by: &str) -
         ("search".to_owned(), search.entry_key.clone()),
         ("selectedid".to_owned(), selected_id.to_owned()),
         ("selectedby".to_owned(), selected_by.to_owned()),
-        ("method".to_owned(), "agent-review".to_owned()),
+        ("method".to_owned(), method.to_owned()),
         (
             "toolversion".to_owned(),
             env!("CARGO_PKG_VERSION").to_owned(),
         ),
     ]);
+    if let Some(matched) = matched {
+        fields.insert("matchscore".to_owned(), matched.score.to_string());
+        fields.insert("titlescore".to_owned(), matched.title_score.to_string());
+        fields.insert("authorscore".to_owned(), matched.author_score.to_string());
+        fields.insert("threshold".to_owned(), matched.threshold.to_string());
+        fields.insert("matchrule".to_owned(), "0.7*title+0.3*author".to_owned());
+    }
     let identity = evidence_identity(&fields);
     Ok(Record {
         entry_type: SOURCE_TYPE.to_owned(),
@@ -536,12 +567,25 @@ fn validate_provider(record: &Record, source: &Record, records: &[Record]) -> Re
     if required(source, "projection")? != "literature-record-v1" {
         bail!("unsupported provider projection");
     }
+    if let Some(method) = source.fields.get("requestmethod") {
+        if !matches!(method.as_str(), "GET" | "POST") {
+            bail!("unsupported provider request method");
+        }
+        if method == "POST" {
+            required_sha256(source, "requestbodysha256")?;
+        }
+    }
+    if source.fields.contains_key("requestbodysha256") {
+        required_sha256(source, "requestbodysha256")?;
+    }
     let expected_key = format!(
         "bibsource:provider:{}",
         provider_identity(ProviderIdentity {
             provider,
             provider_id,
             request_url: required(source, "requesturl")?,
+            request_method: source.fields.get("requestmethod").map(String::as_str),
+            request_body_sha256: source.fields.get("requestbodysha256").map(String::as_str),
             media_type: required(source, "mediatype")?,
             projection: required(source, "projection")?,
             tool_version: required(source, "toolversion")?,
@@ -626,7 +670,10 @@ fn validate_selection(source: &Record, records: &[Record]) -> Result<()> {
     if source.entry_key != format!("bibsource:selection:{}", evidence_identity(&source.fields)) {
         bail!("selection provenance key does not match its metadata");
     }
-    if required(source, "method")? != "agent-review" {
+    if !matches!(
+        required(source, "method")?,
+        "agent-review" | "browser-review"
+    ) {
         bail!("unsupported selection method");
     }
     required(source, "selectedby")?;
@@ -642,6 +689,33 @@ fn validate_selection(source: &Record, records: &[Record]) -> Result<()> {
         .any(|candidate_id| candidate_id.eq_ignore_ascii_case(selected_id))
     {
         bail!("selected provider id is absent from search evidence");
+    }
+    let match_fields = [
+        "matchscore",
+        "titlescore",
+        "authorscore",
+        "threshold",
+        "matchrule",
+    ];
+    let present = match_fields
+        .iter()
+        .filter(|field| source.fields.contains_key(**field))
+        .count();
+    if present != 0 && present != match_fields.len() {
+        bail!("selection has incomplete match evidence");
+    }
+    if present == match_fields.len() {
+        for field in &match_fields[..4] {
+            let value: f64 = required(source, field)?
+                .parse()
+                .with_context(|| format!("selection {field} is not numeric"))?;
+            if !(0.0..=1.0).contains(&value) {
+                bail!("selection {field} is outside 0..1");
+            }
+        }
+        if required(source, "matchrule")? != "0.7*title+0.3*author" {
+            bail!("unsupported selection match rule");
+        }
     }
     Ok(())
 }
@@ -786,6 +860,8 @@ struct ProviderIdentity<'a> {
     provider: &'a str,
     provider_id: &'a str,
     request_url: &'a str,
+    request_method: Option<&'a str>,
+    request_body_sha256: Option<&'a str>,
     media_type: &'a str,
     projection: &'a str,
     tool_version: &'a str,
@@ -800,6 +876,8 @@ fn provider_identity(value: ProviderIdentity<'_>) -> String {
         provider,
         provider_id,
         request_url,
+        request_method,
+        request_body_sha256,
         media_type,
         projection,
         tool_version,
@@ -811,6 +889,14 @@ fn provider_identity(value: ProviderIdentity<'_>) -> String {
     let mut identity = format!(
         "provider\0{provider}\0{provider_id}\0{request_url}\0{media_type}\0{projection}\0{tool_version}\0{response_sha256}"
     );
+    if let Some(request_method) = request_method {
+        identity.push_str("\0requestmethod\0");
+        identity.push_str(request_method);
+    }
+    if let Some(request_body_sha256) = request_body_sha256 {
+        identity.push_str("\0requestbodysha256\0");
+        identity.push_str(request_body_sha256);
+    }
     if let Some(projection_sha256) = projection_sha256 {
         identity.push_str("\0projectionsha256\0");
         identity.push_str(projection_sha256);

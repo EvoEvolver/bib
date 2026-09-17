@@ -234,6 +234,8 @@ pub struct Candidate {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BibliographicQuery {
     pub citation: String,
+    #[serde(default)]
+    pub title_only: bool,
 }
 
 impl BibliographicQuery {
@@ -250,7 +252,26 @@ impl BibliographicQuery {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(". ");
-        Self { citation }
+        Self {
+            citation,
+            title_only: false,
+        }
+    }
+}
+
+pub fn title_search_query(record: &Record) -> BibliographicQuery {
+    let title = record.fields.get("title").map(String::as_str).unwrap_or("");
+    let mut plain = String::with_capacity(title.len());
+    for character in title.chars() {
+        match character {
+            '{' | '}' | '\\' => {}
+            '~' => plain.push(' '),
+            character => plain.push(character),
+        }
+    }
+    BibliographicQuery {
+        citation: plain.split_whitespace().collect::<Vec<_>>().join(" "),
+        title_only: true,
     }
 }
 
@@ -323,5 +344,25 @@ mod tests {
         assert_eq!(fields["journal"], "A Journal");
         assert_eq!(fields[PROVIDER_FIELD], "test");
         assert_eq!(fields[PROVIDER_ID_FIELD], "work-1");
+    }
+
+    #[test]
+    fn title_search_removes_bibtex_grouping_without_changing_the_record() {
+        let record = Record {
+            entry_type: "article".into(),
+            entry_key: "one".into(),
+            fields: BTreeMap::from([(
+                "title".into(),
+                "{Writing and {Working} Memory}: \\LaTeX~Notes".into(),
+            )]),
+        };
+        assert_eq!(
+            title_search_query(&record).citation,
+            "Writing and Working Memory: LaTeX Notes"
+        );
+        assert_eq!(
+            record.fields["title"],
+            "{Writing and {Working} Memory}: \\LaTeX~Notes"
+        );
     }
 }

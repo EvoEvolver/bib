@@ -117,23 +117,48 @@ an entry is ambiguous, inspect its candidates and apply the chosen provider ID
 explicitly:
 
 ```sh
-biblock source plan references.bib --key paper1
+biblock source match references.bib --key paper1 --min-score 0.9
 
 biblock source apply references.bib \
   --key paper1 \
   --id 10.1234/chosen-record \
   --selected-by codex \
+  --min-score 0.9 \
   --add-integrity \
   --in-place
+```
+
+`source match` searches a provider by title and reports separate title, author, and
+combined scores (`0.7 * title + 0.3 * author`) plus field-level changes. The
+threshold authorizes an agent to adopt a candidate after reading the comparison;
+it does not trigger an automatic replacement. More than one qualifying candidate,
+or any semantic doubt such as preprint versus published version, stays in review.
+
+Crossref is the default. OpenReview is also available for public notes:
+
+```sh
+biblock source match references.bib --provider openreview --key paper1
+biblock source apply references.bib --provider openreview --key paper1 \
+  --id NOTE_ID --selected-by codex --min-score 0.9 --add-integrity --in-place
 ```
 
 Then inspect the evidence and validate the repository state:
 
 ```sh
 biblock source trace references.bib --key paper1 | jq .
+biblock review references.bib
 biblock integrity status references.bib
 biblock lock references.bib --frozen
 ```
+
+`review` opens a local browser page showing every BibTeX field. Crossref and
+OpenReview searches run only when their buttons are clicked, then show the full
+post-adoption record beside the current entry. A reviewer can adopt a provider
+record, paste and preview a complete replacement BibTeX entry, or approve the
+existing entry. Pasted entries keep the current citation key and become verified
+through a content-bound human approval. The reviewer label defaults to the
+computer name, but can be changed or left blank. Each action is written
+immediately and preserves the original provenance chain.
 
 `integrity status` is the release gate: `verified` means the current content and
 evidence chain are valid and the direct source is either an exact provider receipt
@@ -167,9 +192,11 @@ presented as provider verification or cryptographic identity.
 | `biblock inspect [FILE ...]` | Emit entries and trust state as JSON |
 | `biblock dedupe [FILE ...]` | Generate title-and-author duplicate candidates |
 | `biblock source verify FILE --all` | Check exact identifiers across a bibliography |
+| `biblock source match FILE --key KEY` | Score Crossref title matches for agent review |
 | `biblock source plan FILE --key KEY` | Show candidates and field-level changes |
 | `biblock source apply FILE --key KEY` | Apply one explicit provider record |
 | `biblock source trace FILE --key KEY` | Show the evidence chain for an entry |
+| `biblock review FILE` | Review evidence and record content-bound human approval in a browser |
 | `biblock integrity status FILE` | Require API verification or explicit human approval for every entry |
 | `biblock lock FILE --frozen` | Fail if the lockfile is missing or out of sync |
 | `biblock history log FILE --key KEY` | Show an entry's recorded revisions |

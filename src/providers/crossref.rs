@@ -109,6 +109,8 @@ impl LiteratureProvider for CrossrefProvider {
             request_url,
             media_type: "application/vnd.crossref-api-message+json".to_owned(),
             response,
+            request_method: "GET".to_owned(),
+            request_body_sha256: None,
         })
     }
 
@@ -118,7 +120,14 @@ impl LiteratureProvider for CrossrefProvider {
         }
         let mut url = self.works_url(None)?;
         url.query_pairs_mut()
-            .append_pair("query.bibliographic", &query.citation)
+            .append_pair(
+                if query.title_only {
+                    "query.title"
+                } else {
+                    "query.bibliographic"
+                },
+                &query.citation,
+            )
             .append_pair("rows", &limit.clamp(1, 20).to_string());
         let (request_url, response) = self.get(url)?;
         let parsed: SearchResponse =

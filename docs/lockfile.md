@@ -18,7 +18,7 @@ Its top-level sections are:
 - `lockfileVersion` and `toolVersion`, which identify the format and writer;
 - `bibliography.contentHash`, which binds the complete clean bibliography;
 - `entries`, keyed by citation key, containing canonical content, current source,
-  integrity state, provider identity, a snapshot, and the history head;
+  integrity state, provider identity, human approval, a snapshot, and the history head;
 - `sources`, containing content-addressed provider, web, resolution, search,
   selection, human, and agent evidence;
 - `revisions`, containing content-addressed prior entry states.
@@ -40,6 +40,16 @@ Its top-level sections are:
       "integrity": {
         "contentHash": "...",
         "source": "bibsource:provider:..."
+      },
+      "approval": {
+        "id": "...",
+        "kind": "human",
+        "method": "browser-review",
+        "reviewer": "workstation-name",
+        "target": "turing1936",
+        "contentHash": "...",
+        "timestamp": 1789516800,
+        "batchId": "..."
       },
       "head": "rev:8f31c9d0"
     }
@@ -129,18 +139,38 @@ Integrity states are:
 
 ## Evidence chains
 
-Provider receipts retain the provider and stable record ID, request URL, media
-type, response SHA-256, deterministic projection, and projection hash. The
-current provider-controlled BibTeX fields must match that projection.
+Provider receipts retain the provider and stable record ID, request URL and
+method, optional POST body SHA-256, media type, response SHA-256, deterministic
+projection, and projection hash. The current provider-controlled BibTeX fields
+must match that projection. Built-in providers include Crossref, DOI content
+negotiation, and public OpenReview notes.
 
 When a URL was resolved first, the provider receipt links to resolution evidence
 containing the original and final URLs, matched identifier, signals, and any
 network-response hash. When a search candidate was selected, it also links to the
 query, candidate set, response hash, chosen ID, and selector identity.
 
+Threshold-authorized agent selection also records the combined match score,
+separate title and author scores, the threshold, and the fixed rule
+`0.7*title+0.3*author`. The threshold does not select a record by itself: the agent
+must read the comparison and explicitly adopt the provider ID. Browser selection
+uses the same search-to-selection-to-provider chain with method `browser-review`.
+
 Web receipts bind an existing entry to a fetched page without claiming that a
 literature provider verified it. Human and agent sources bind an actor label and
 the entry content they approved.
+
+Browser approval is an independent overlay on the entry rather than a replacement
+source. It records a content-addressed approval ID, target key, current content
+hash, timestamp, batch ID, and optional reviewer label. The label defaults to the
+computer name in the UI, but may be changed or omitted and is not an authenticated
+identity. Editing the entry invalidates the approval while revision history keeps
+the prior evidence.
+
+The review UI can also replace an entry from pasted BibTeX. It accepts exactly
+one regular entry, preserves the current citation key, previews every field
+change, and records the replacement plus its content-bound human approval as one
+atomic `human-paste` revision.
 
 Structured values such as candidates, signals, and projections are native JSON,
 not JSON strings, so they remain directly queryable with `jq`.

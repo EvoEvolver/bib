@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::bibtex::{Record, parse, render};
 use crate::catalog::{PROVIDER_FIELD, PROVIDER_ID_FIELD};
 use crate::integrity::{
-    FIELD as INTEGRITY_FIELD, atomic_write, hash, remove_entry_types, remove_fields,
+    APPROVAL_BATCH_FIELD, APPROVAL_CONTENT_FIELD, APPROVAL_FIELDS, APPROVAL_ID_FIELD,
+    APPROVAL_KIND_FIELD, APPROVAL_METHOD_FIELD, APPROVAL_REVIEWER_FIELD, APPROVAL_TIMESTAMP_FIELD,
+    FIELD as INTEGRITY_FIELD, approval_id, atomic_write, hash, remove_entry_types, remove_fields,
     update_entry_fields,
 };
 use crate::provenance::{SOURCE_FIELD, SOURCE_TYPE};
@@ -22,7 +24,28 @@ const WORKFLOW_FIELDS: &[&str] = &[
     PROVIDER_FIELD,
     PROVIDER_ID_FIELD,
     "bibprevious",
+    APPROVAL_ID_FIELD,
+    APPROVAL_KIND_FIELD,
+    APPROVAL_METHOD_FIELD,
+    APPROVAL_REVIEWER_FIELD,
+    APPROVAL_CONTENT_FIELD,
+    APPROVAL_TIMESTAMP_FIELD,
+    APPROVAL_BATCH_FIELD,
 ];
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalLock {
+    pub id: String,
+    pub kind: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    pub target: String,
+    pub content_hash: String,
+    pub timestamp: u64,
+    pub batch_id: String,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +73,8 @@ pub struct EntryLock {
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<IntegrityLock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalLock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
 }
@@ -151,6 +176,90 @@ pub fn commit_edit(
         actor,
         false,
     )
+}
+
+pub fn approve(file: &Path, keys: &BTreeSet<String>, reviewer: Option<&str>) -> Result<usize> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let expected = hydrate_file(file)?;
+    let proposed = add_approvals(file, &expected, keys, reviewer)?;
+    let actor = reviewer
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("anonymous-browser-review");
+    commit_edit(
+        file,
+        None,
+        &expected,
+        &proposed,
+        "human-approve",
+        Some(actor),
+    )?;
+    Ok(keys.len())
+}
+
+pub fn commit_human_edit(
+    file: &Path,
+    expected: &str,
+    proposed: &str,
+    key: &str,
+    reviewer: Option<&str>,
+    operation: &str,
+) -> Result<bool> {
+    let keys = BTreeSet::from([key.to_owned()]);
+    let approved = add_approvals(file, proposed, &keys, reviewer)?;
+    let actor = reviewer
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("anonymous-browser-review");
+    commit_edit(file, None, expected, &approved, operation, Some(actor))
+}
+
+fn add_approvals(
+    file: &Path,
+    source: &str,
+    keys: &BTreeSet<String>,
+    reviewer: Option<&str>,
+) -> Result<String> {
+    let records = parse(source)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let reviewer = reviewer.map(str::trim).filter(|value| !value.is_empty());
+    let batch_id =
+        sha256(serde_json::to_string(&(file.display().to_string(), timestamp, keys))?.as_bytes())
+            [..16]
+            .to_owned();
+    let mut proposed = source.to_owned();
+    for key in keys {
+        let record = records
+            .iter()
+            .find(|record| !record.is_system() && record.entry_key == *key)
+            .with_context(|| format!("citation key not found: {key}"))?;
+        let approval = ApprovalLock {
+            id: String::new(),
+            kind: "human".to_owned(),
+            method: "browser-review".to_owned(),
+            reviewer: reviewer.map(str::to_owned),
+            target: key.clone(),
+            content_hash: hash(record)?,
+            timestamp,
+            batch_id: batch_id.clone(),
+        };
+        let approval = ApprovalLock {
+            id: approval_id_for(&approval),
+            ..approval
+        };
+        proposed = update_entry_fields(
+            &proposed,
+            key,
+            &record.entry_type,
+            &approval_fields(&approval),
+        )?;
+    }
+    Ok(proposed)
 }
 
 pub fn sync(
@@ -432,6 +541,9 @@ fn hydrate(source: &str, lock: &LockFile) -> Result<String> {
                 };
                 fields.insert(INTEGRITY_FIELD.to_owned(), marker);
             }
+            if let Some(approval) = &state.approval {
+                fields.extend(approval_fields(approval));
+            }
             if !fields.is_empty() {
                 output =
                     update_entry_fields(&output, &record.entry_key, &record.entry_type, &fields)?;
@@ -533,6 +645,7 @@ fn capture(source: &str, mut lock: LockFile) -> Result<(String, LockFile)> {
             Some(_) => old.integrity,
             None => None,
         };
+        let approval = decode_approval(virtual_record)?;
         entries.insert(
             record.entry_key.clone(),
             EntryLock {
@@ -542,6 +655,7 @@ fn capture(source: &str, mut lock: LockFile) -> Result<(String, LockFile)> {
                 provider: virtual_record.fields.get(PROVIDER_FIELD).cloned(),
                 provider_id: virtual_record.fields.get(PROVIDER_ID_FIELD).cloned(),
                 integrity,
+                approval,
                 head: old.head,
             },
         );
@@ -549,6 +663,69 @@ fn capture(source: &str, mut lock: LockFile) -> Result<(String, LockFile)> {
     lock.entries = entries;
     lock.bibliography.content_hash = document_hash(&clean)?;
     Ok((clean, lock))
+}
+
+fn approval_fields(approval: &ApprovalLock) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::from([
+        (APPROVAL_ID_FIELD.to_owned(), approval.id.clone()),
+        (APPROVAL_KIND_FIELD.to_owned(), approval.kind.clone()),
+        (APPROVAL_METHOD_FIELD.to_owned(), approval.method.clone()),
+        (
+            APPROVAL_CONTENT_FIELD.to_owned(),
+            approval.content_hash.clone(),
+        ),
+        (
+            APPROVAL_TIMESTAMP_FIELD.to_owned(),
+            approval.timestamp.to_string(),
+        ),
+        (APPROVAL_BATCH_FIELD.to_owned(), approval.batch_id.clone()),
+    ]);
+    if let Some(reviewer) = &approval.reviewer {
+        fields.insert(APPROVAL_REVIEWER_FIELD.to_owned(), reviewer.clone());
+    }
+    fields
+}
+
+fn decode_approval(record: &Record) -> Result<Option<ApprovalLock>> {
+    if !APPROVAL_FIELDS
+        .iter()
+        .any(|field| record.fields.contains_key(*field))
+    {
+        return Ok(None);
+    }
+    let required = |field: &str| {
+        record
+            .fields
+            .get(field)
+            .cloned()
+            .with_context(|| format!("entry {} has incomplete approval", record.entry_key))
+    };
+    Ok(Some(ApprovalLock {
+        id: required(APPROVAL_ID_FIELD)?,
+        kind: required(APPROVAL_KIND_FIELD)?,
+        method: required(APPROVAL_METHOD_FIELD)?,
+        reviewer: record.fields.get(APPROVAL_REVIEWER_FIELD).cloned(),
+        target: record.entry_key.clone(),
+        content_hash: required(APPROVAL_CONTENT_FIELD)?,
+        timestamp: required(APPROVAL_TIMESTAMP_FIELD)?
+            .parse()
+            .with_context(|| {
+                format!("entry {} has invalid approval timestamp", record.entry_key)
+            })?,
+        batch_id: required(APPROVAL_BATCH_FIELD)?,
+    }))
+}
+
+fn approval_id_for(approval: &ApprovalLock) -> String {
+    approval_id(
+        &approval.kind,
+        &approval.method,
+        approval.reviewer.as_deref(),
+        &approval.target,
+        &approval.content_hash,
+        approval.timestamp,
+        &approval.batch_id,
+    )
 }
 
 fn apply_state_fields(record: &mut Record, state: &EntryLock) {
@@ -574,6 +751,9 @@ fn apply_state_fields(record: &mut Record, state: &EntryLock) {
         };
         record.fields.insert(INTEGRITY_FIELD.to_owned(), marker);
     }
+    if let Some(approval) = &state.approval {
+        record.fields.extend(approval_fields(approval));
+    }
 }
 
 fn equivalent_state(old: Option<&EntryLock>, new: Option<&EntryLock>) -> bool {
@@ -586,6 +766,7 @@ fn equivalent_state(old: Option<&EntryLock>, new: Option<&EntryLock>) -> bool {
                 && old.provider_id == new.provider_id
                 && serde_json::to_value(&old.integrity).ok()
                     == serde_json::to_value(&new.integrity).ok()
+                && old.approval == new.approval
         }
         _ => false,
     }
@@ -704,6 +885,22 @@ fn validation_errors(lock: &LockFile) -> Vec<String> {
             }
             if entry.source.as_ref() != Some(&integrity.source) {
                 errors.push(format!("entry {key} integrity source does not match"));
+            }
+        }
+        if let Some(approval) = &entry.approval {
+            if approval.kind != "human" || approval.method != "browser-review" {
+                errors.push(format!("entry {key} has invalid approval type"));
+            }
+            if approval.target != *key || !is_sha256(&approval.content_hash) {
+                errors.push(format!(
+                    "entry {key} has invalid approval target or contentHash"
+                ));
+            }
+            if approval.timestamp == 0 || approval.batch_id.trim().is_empty() {
+                errors.push(format!("entry {key} has incomplete approval evidence"));
+            }
+            if approval.id != approval_id_for(approval) {
+                errors.push(format!("entry {key} has invalid approval id"));
             }
         }
     }

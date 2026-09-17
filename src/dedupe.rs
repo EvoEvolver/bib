@@ -3,6 +3,29 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use crate::bibtex::Record;
+use crate::catalog::LiteratureRecord;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Similarity {
+    pub score: f64,
+    pub title_score: f64,
+    pub author_score: f64,
+}
+
+pub fn literature_similarity(current: &Record, candidate: &LiteratureRecord) -> Option<Similarity> {
+    let left_title = current.fields.get("title")?;
+    let left_author = current.fields.get("author")?;
+    let fields = candidate.bibtex_fields();
+    let right_title = fields.get("title")?;
+    let right_author = fields.get("author")?;
+    let title_score = token_dice(&tokens(left_title), &tokens(right_title));
+    let author_score = author_similarity(left_author, right_author);
+    Some(Similarity {
+        score: rounded(0.7 * title_score + 0.3 * author_score),
+        title_score: rounded(title_score),
+        author_score: rounded(author_score),
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct LocatedRecord {
@@ -109,7 +132,9 @@ fn normalized_words(value: &str) -> Vec<String> {
     let mut normalized = String::new();
     let mut chars = value.chars().peekable();
     while let Some(character) = chars.next() {
-        if character == '\\' {
+        if matches!(character, '{' | '}') {
+            continue;
+        } else if character == '\\' {
             if chars.peek().is_some_and(|next| next.is_alphabetic()) {
                 while chars.peek().is_some_and(|next| next.is_alphabetic()) {
                     chars.next();
@@ -170,5 +195,26 @@ mod tests {
             located("@article{two, title={Same}}"),
         ];
         assert!(candidates(&records, 0.0).is_empty());
+    }
+
+    #[test]
+    fn scores_literature_candidates_with_the_same_title_author_rule() {
+        let current =
+            located("@article{one, title={A Great Paper}, author={Smith, John and Doe, Jane}}");
+        let candidate = LiteratureRecord::from_bibtex_record(
+            "crossref",
+            "10.1/example",
+            &located("@article{two, title={A {Great} Paper}, author={John Smith and Jane Doe}}")
+                .record,
+        );
+        let score = literature_similarity(&current.record, &candidate).unwrap();
+        assert_eq!(score.title_score, 1.0);
+        assert!(score.author_score >= 0.75);
+        assert!(score.score >= 0.9);
+    }
+
+    #[test]
+    fn tex_grouping_does_not_split_a_word() {
+        assert_eq!(tokens("Open-Source {LLM}s"), tokens("Open Source LLMs"));
     }
 }

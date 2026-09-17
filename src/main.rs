@@ -8,18 +8,19 @@ use anyhow::{Context, Result, bail};
 use biblock_cli::bibtex::{Record, parse, render};
 use biblock_cli::catalog::{
     BibliographicQuery, Candidate, FieldChange, LiteratureIdentifier, LiteratureRecord,
-    PROVIDER_FIELD, PROVIDER_ID_FIELD, changes,
+    PROVIDER_FIELD, PROVIDER_ID_FIELD, changes, title_search_query,
 };
 use biblock_cli::dedupe::{self, LocatedRecord};
 use biblock_cli::history;
 use biblock_cli::inspect;
 use biblock_cli::integrity::{
-    Status, hash, remove_entry_type_fields, status, update_entry_fields, update_entry_fields_exact,
-    update_source,
+    APPROVAL_FIELDS, Status, hash, remove_entry_type_fields, status, update_entry_fields,
+    update_entry_fields_exact, update_source,
 };
 use biblock_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SOURCE_TYPE, SourceKind};
 use biblock_cli::providers::{self, DEFAULT_PROVIDER};
 use biblock_cli::resolver::{self, ResolutionReport};
+use biblock_cli::review;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -53,6 +54,12 @@ LITERATURE SOURCES
   For explicit candidate review and key-by-key reconciliation:
     biblock source plan refs.bib --key paper1
     biblock source apply refs.bib --key paper1 --in-place
+
+  Compare provider title-search results with a fixed title/author score before an
+  agent explicitly adopts one candidate (use --provider openreview when needed):
+    biblock source match refs.bib --key paper1 --min-score 0.9
+    biblock source apply refs.bib --key paper1 --id DOI --selected-by AGENT \
+      --min-score 0.9 --add-integrity --in-place
 
   A URL is resolved to a stable DOI from the URL itself, redirects, publisher
   metadata, JSON-LD, or an official identifier API:
@@ -88,6 +95,11 @@ EDIT HISTORY
     biblock history status refs.bib
     biblock history log refs.bib --key paper1
     biblock history restore refs.bib --revision 8f31c9d0 --in-place
+
+HUMAN REVIEW
+  Open a local review page. The reviewer label defaults to the computer name,
+  but may be edited or left blank:
+    biblock review refs.bib
 
 INTEGRITY
   verified    Valid integrity backed by a provider API or explicit human approval.
@@ -242,6 +254,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Review and approve entries in a local browser.
+    Review(ReviewArgs),
     /// Emit bibliography entries and their trust state as JSON.
     Inspect(InspectArgs),
     /// Find likely duplicate entries by title and author similarity.
@@ -254,6 +268,20 @@ enum Command {
     History(HistoryArgs),
     /// Check or synchronize the JSON sidecar lockfile.
     Lock(LockArgs),
+}
+
+#[derive(Args)]
+struct ReviewArgs {
+    file: PathBuf,
+    /// Mark Crossref title matches at or above this score as agent-adoptable.
+    #[arg(long, default_value_t = 0.9, value_parser = parse_score)]
+    threshold: f64,
+    /// Do not open the default browser automatically.
+    #[arg(long)]
+    no_open: bool,
+    /// Local port. Uses an available random port by default.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
 }
 
 #[derive(Args, Clone, Default)]
@@ -400,6 +428,26 @@ enum SourceCommand {
         #[arg(long, env = "BIBLOCK_MAILTO")]
         mailto: Option<String>,
     },
+    /// Compare entries with provider title-search candidates for agent review.
+    Match {
+        file: PathBuf,
+        #[arg(long, default_value = "crossref")]
+        provider: String,
+        #[arg(short, long)]
+        key: Vec<String>,
+        #[arg(long, value_name = "FILE")]
+        keys_from: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["key", "keys_from"])]
+        all: bool,
+        #[arg(long, default_value_t = 5, value_parser = parse_limit)]
+        limit: usize,
+        #[arg(long, default_value_t = 0.9, value_parser = parse_score)]
+        min_score: f64,
+        #[arg(short, long)]
+        compact: bool,
+        #[arg(long, env = "BIBLOCK_MAILTO")]
+        mailto: Option<String>,
+    },
     /// Plan provider replacements for explicitly selected BibTeX entries.
     Plan {
         file: PathBuf,
@@ -437,6 +485,9 @@ enum SourceCommand {
         /// Record an auditable search-and-selection chain for an explicit id.
         #[arg(long, requires = "id", value_name = "ACTOR")]
         selected_by: Option<String>,
+        /// Require the selected result to meet the title/author similarity threshold.
+        #[arg(long, requires = "selected_by", value_parser = parse_score)]
+        min_score: Option<f64>,
         /// Candidate count retained when recording a selection.
         #[arg(long, default_value_t = 5, requires = "selected_by", value_parser = parse_limit)]
         search_limit: usize,
@@ -622,9 +673,33 @@ struct StatusRow<'a> {
 
 #[derive(Serialize)]
 struct PlannedCandidate {
-    score: Option<f64>,
+    provider_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_score: Option<f64>,
     record: LiteratureRecord,
     changes: Vec<FieldChange>,
+}
+
+#[derive(Serialize)]
+struct MatchCandidate {
+    adoptable: bool,
+    #[serde(flatten)]
+    candidate: PlannedCandidate,
+}
+
+#[derive(Serialize)]
+struct MatchRow {
+    id: String,
+    query: String,
+    min_score: f64,
+    unique_adoptable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    candidates: Vec<MatchCandidate>,
 }
 
 #[derive(Serialize)]
@@ -679,6 +754,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<u8> {
     match cli.command {
+        Command::Review(args) => review::run(&args.file, args.port, !args.no_open, args.threshold),
         Command::Inspect(args) => {
             let InspectArgs {
                 files,
@@ -786,9 +862,83 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             mailto,
         } => {
             let backend = providers::open(&provider, mailto.as_deref())?;
-            let search = backend.search(&BibliographicQuery { citation: query }, limit)?;
+            let search = backend.search(
+                &BibliographicQuery {
+                    citation: query,
+                    title_only: false,
+                },
+                limit,
+            )?;
             print_serializable(&search.candidates, compact)?;
             Ok(if search.candidates.is_empty() { 3 } else { 0 })
+        }
+        SourceCommand::Match {
+            file,
+            provider,
+            key,
+            keys_from,
+            all,
+            limit,
+            min_score,
+            compact,
+            mailto,
+        } => {
+            let source = read_file(&file)?;
+            let records = parse(&source)?;
+            let selected = select_records(&records, merge_keys(key, keys_from)?, all)?;
+            let backend = providers::open(&provider, mailto.as_deref())?;
+            let mut rows = Vec::new();
+            for record in selected {
+                let query = title_query(record);
+                if query.citation.trim().is_empty() {
+                    rows.push(MatchRow {
+                        id: record.entry_key.clone(),
+                        query: String::new(),
+                        min_score,
+                        unique_adoptable: false,
+                        error: Some("entry has no title".to_owned()),
+                        candidates: vec![],
+                    });
+                    continue;
+                }
+                match backend.search(&query, limit) {
+                    Ok(search) => {
+                        let candidates: Vec<_> = search
+                            .candidates
+                            .into_iter()
+                            .map(|candidate| {
+                                let candidate = planned_candidate(record, candidate);
+                                MatchCandidate {
+                                    adoptable: candidate
+                                        .match_score
+                                        .is_some_and(|score| score >= min_score),
+                                    candidate,
+                                }
+                            })
+                            .collect();
+                        let unique_adoptable =
+                            candidates.iter().filter(|item| item.adoptable).count() == 1;
+                        rows.push(MatchRow {
+                            id: record.entry_key.clone(),
+                            query: query.citation,
+                            min_score,
+                            unique_adoptable,
+                            error: None,
+                            candidates,
+                        });
+                    }
+                    Err(error) => rows.push(MatchRow {
+                        id: record.entry_key.clone(),
+                        query: query.citation,
+                        min_score,
+                        unique_adoptable: false,
+                        error: Some(format!("{error:#}")),
+                        candidates: vec![],
+                    }),
+                }
+            }
+            print_serializable(&rows, compact)?;
+            Ok(0)
         }
         SourceCommand::Plan {
             file,
@@ -931,7 +1081,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                     }
                 } else {
                     needs_review = true;
-                    let query = BibliographicQuery::from_record(record);
+                    let query = title_query(record);
                     match backend.search(&query, limit) {
                         Ok(search) => rows.push(PlanRow {
                             id: record.entry_key.clone(),
@@ -966,6 +1116,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             key,
             id,
             selected_by,
+            min_score,
             search_limit,
             provider,
             in_place,
@@ -1031,12 +1182,42 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 let selected_id = explicit_id
                     .as_deref()
                     .context("--selected-by requires an explicit --id")?;
-                let query = BibliographicQuery::from_record(record);
+                let query = title_query(record);
                 let search = backend.search(&query, search_limit)?;
                 let search_source =
                     provenance::search_source(record, &query, &search, &provider_name)?;
-                let selection_source =
-                    provenance::selection_source(&search_source, selected_id, actor)?;
+                let selected_candidate = search
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.record.id.eq_ignore_ascii_case(selected_id))
+                    .with_context(|| {
+                        format!(
+                            "selected provider id {selected_id} was not returned by title search"
+                        )
+                    })?;
+                let similarity = dedupe::literature_similarity(record, &selected_candidate.record)
+                    .context("title/author scoring requires both fields on both records")?;
+                if let Some(threshold) = min_score
+                    && similarity.score < threshold
+                {
+                    bail!(
+                        "selected match score {:.4} is below --min-score {:.4}",
+                        similarity.score,
+                        threshold
+                    );
+                }
+                let selection_source = provenance::selection_source_with_match(
+                    &search_source,
+                    selected_id,
+                    actor,
+                    "agent-review",
+                    min_score.map(|threshold| provenance::MatchEvidence {
+                        score: similarity.score,
+                        title_score: similarity.title_score,
+                        author_score: similarity.author_score,
+                        threshold,
+                    }),
+                )?;
                 Some(SelectionEvidence {
                     search: search_source,
                     selection: selection_source,
@@ -1570,8 +1751,12 @@ fn field_resolution_candidate(
 }
 
 fn planned_candidate(record: &Record, candidate: Candidate) -> PlannedCandidate {
+    let similarity = dedupe::literature_similarity(record, &candidate.record);
     PlannedCandidate {
-        score: candidate.score,
+        provider_score: candidate.score,
+        match_score: similarity.map(|value| value.score),
+        title_score: similarity.map(|value| value.title_score),
+        author_score: similarity.map(|value| value.author_score),
         changes: changes(record, &candidate.record),
         record: candidate.record,
     }
@@ -1595,6 +1780,10 @@ fn source_identity(record: &Record, requested: Option<&str>) -> (String, Option<
             |(provider, id)| (provider.to_owned(), Some(id.to_owned())),
         ),
     }
+}
+
+fn title_query(record: &Record) -> BibliographicQuery {
+    title_search_query(record)
 }
 
 fn select_records(records: &[Record], keys: Vec<String>, all: bool) -> Result<Vec<&Record>> {
@@ -1922,7 +2111,20 @@ fn remove_integrity(
     let source = read_file(file)?;
     let records = parse(&source)?;
     let selected = selected_keys(&records, keys, all)?;
-    let output = update_source(&source, &records, &selected, true)?;
+    let mut output = update_source(&source, &records, &selected, true)?;
+    for key in &selected {
+        let record = records
+            .iter()
+            .find(|record| record.entry_key == *key)
+            .with_context(|| format!("citation key not found: {key}"))?;
+        output = update_entry_fields_exact(
+            &output,
+            key,
+            &record.entry_type,
+            &BTreeMap::new(),
+            APPROVAL_FIELDS,
+        )?;
+    }
     write_changed(
         file,
         &source,

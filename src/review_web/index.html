@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>biblock review</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <strong class="brand">biblock</strong>
+      <span class="file" id="file"></span>
+      <strong class="progress" id="progress"></strong>
+      <button id="finish">Finish</button>
+    </header>
+
+    <nav class="toolbar" aria-label="Review controls">
+      <div class="tabs">
+        <button class="active" data-filter="pending">Needs review</button>
+        <button data-filter="all">All</button>
+        <button data-filter="verified">Verified</button>
+      </div>
+      <input id="search" type="search" placeholder="Search key, title, or author" aria-label="Search entries">
+      <input id="reviewer" class="reviewer" aria-label="Reviewer name" placeholder="Reviewer (optional)">
+      <button id="select-visible">Select visible</button>
+      <button id="approve-selected" class="primary" disabled>Approve selected</button>
+      <button id="approve-all">Approve all remaining</button>
+    </nav>
+
+    <main class="workspace">
+      <section class="entry-list" id="entry-list" aria-label="Bibliography entries"></section>
+      <section class="detail" id="detail">
+        <p class="empty">Select an entry to inspect its evidence.</p>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script src="app.js" defer></script>
+  </body>
+</html>
