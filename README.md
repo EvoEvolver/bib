@@ -71,7 +71,7 @@ biblock --version
 
 ### Prebuilt releases
 
-Releases from `v0.10.0` onward provide binaries for Linux x86_64/ARM64 and macOS
+Releases from `v0.11.0` onward provide binaries for Linux x86_64/ARM64 and macOS
 Intel/Apple Silicon. The installer verifies the downloaded SHA-256 checksum:
 
 ```sh
@@ -80,8 +80,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 ```
 
 Set `BIBLOCK_INSTALL_DIR` to choose the destination or `BIBLOCK_VERSION` to pin a
-release. The default destination is `~/.local/bin`. Until the first `v0.10.0`
-release is tagged, install the current main branch from source instead.
+release. The default destination is `~/.local/bin`.
 
 ## Five-minute workflow
 

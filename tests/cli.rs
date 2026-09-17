@@ -724,7 +724,7 @@ fn json_lockfile_supports_sync_frozen_and_external_edits() {
 
     let lock = read_lock(&path);
     assert_eq!(lock["lockfileVersion"], "1.0");
-    assert_eq!(lock["toolVersion"], "0.10.0");
+    assert_eq!(lock["toolVersion"], env!("CARGO_PKG_VERSION"));
     assert!(lock["bibliography"]["contentHash"].is_string());
     assert!(lock["entries"]["alpha"]["contentHash"].is_string());
     assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);

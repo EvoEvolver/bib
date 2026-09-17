@@ -26,7 +26,7 @@ Its top-level sections are:
 ```json
 {
   "lockfileVersion": "1.0",
-  "toolVersion": "0.10.0",
+  "toolVersion": "0.11.0",
   "bibliography": { "contentHash": "..." },
   "entries": {
     "turing1936": {
