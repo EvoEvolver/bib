@@ -13,7 +13,7 @@ use crate::catalog::{
     PublicationDate,
 };
 
-use super::{FetchedRecord, LiteratureProvider};
+use super::{FetchedRecord, FetchedSearch, LiteratureProvider};
 
 const DEFAULT_BASE_URL: &str = "https://api.crossref.org/";
 
@@ -25,13 +25,13 @@ pub struct CrossrefProvider {
 
 impl CrossrefProvider {
     pub fn new(mailto: Option<&str>) -> Result<Self> {
-        let base_url =
-            std::env::var("BIB_CROSSREF_API_BASE").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+        let base_url = std::env::var("BIBLOCK_CROSSREF_API_BASE")
+            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
         let base_url = Url::parse(&base_url).context("invalid Crossref API base URL")?;
         let client = Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent(format!(
-                "bib/{} (https://github.com/EvoEvolver/bib{})",
+                "biblock/{} (https://github.com/EvoEvolver/biblock{})",
                 env!("CARGO_PKG_VERSION"),
                 mailto
                     .map(|value| format!("; mailto:{value}"))
@@ -112,7 +112,7 @@ impl LiteratureProvider for CrossrefProvider {
         })
     }
 
-    fn search(&self, query: &BibliographicQuery, limit: usize) -> Result<Vec<Candidate>> {
+    fn search(&self, query: &BibliographicQuery, limit: usize) -> Result<FetchedSearch> {
         if query.citation.trim().is_empty() {
             bail!("cannot search without bibliographic metadata");
         }
@@ -120,10 +120,10 @@ impl LiteratureProvider for CrossrefProvider {
         url.query_pairs_mut()
             .append_pair("query.bibliographic", &query.citation)
             .append_pair("rows", &limit.clamp(1, 20).to_string());
-        let (_, response) = self.get(url)?;
-        let response: SearchResponse =
+        let (request_url, response) = self.get(url)?;
+        let parsed: SearchResponse =
             serde_json::from_slice(&response).context("invalid Crossref search response")?;
-        Ok(response
+        let candidates = parsed
             .message
             .items
             .into_iter()
@@ -131,7 +131,13 @@ impl LiteratureProvider for CrossrefProvider {
                 score: item.score,
                 record: item.work.into_record(self.name()),
             })
-            .collect())
+            .collect();
+        Ok(FetchedSearch {
+            candidates,
+            request_url,
+            media_type: "application/vnd.crossref-api-message+json".to_owned(),
+            response,
+        })
     }
 }
 

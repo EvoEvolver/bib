@@ -12,6 +12,7 @@ use crate::bibtex::Record;
 use crate::provenance;
 
 pub const FIELD: &str = "integrity";
+pub const PREVIOUS_FIELD: &str = "bibprevious";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -40,13 +41,24 @@ pub fn canonical_json(record: &Record) -> Result<String> {
         record
             .fields
             .iter()
-            .filter(|(key, _)| !key.eq_ignore_ascii_case(FIELD))
+            .filter(|(key, _)| {
+                !matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    FIELD | PREVIOUS_FIELD | "bibsource" | "bibprovider" | "bibproviderid"
+                )
+            })
             .map(|(key, value)| (key.to_ascii_lowercase(), value.clone())),
     );
     serde_json::to_string(&payload).context("could not serialize integrity payload")
 }
 
 pub fn hash(record: &Record) -> Result<String> {
+    if record.is_system() {
+        bail!(
+            "{} entries do not participate in integrity",
+            record.entry_type
+        );
+    }
     let digest = Sha256::digest(canonical_json(record)?.as_bytes());
     Ok(format!("{digest:x}"))
 }
@@ -144,14 +156,13 @@ pub fn update_source(
 
 pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let permissions = fs::metadata(path)
-        .with_context(|| format!("could not inspect {}", path.display()))?
-        .permissions();
     let mut temp = NamedTempFile::new_in(parent)
         .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
-    temp.as_file_mut()
-        .set_permissions(permissions)
-        .context("could not preserve file permissions")?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temp.as_file_mut()
+            .set_permissions(metadata.permissions())
+            .context("could not preserve file permissions")?;
+    }
     temp.write_all(contents.as_bytes())
         .context("could not write temporary file")?;
     temp.as_file_mut()
@@ -161,6 +172,20 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
+}
+
+pub fn replace_entry(source: &str, replacement: &Record) -> Result<String> {
+    let spans = scan_entries(source)?;
+    let entry = spans
+        .iter()
+        .find(|entry| entry.key == replacement.entry_key)
+        .with_context(|| format!("citation key not found: {}", replacement.entry_key))?;
+    let mut output = source.to_owned();
+    output.replace_range(
+        entry.type_start.saturating_sub(1)..=entry.close,
+        &crate::bibtex::render(std::slice::from_ref(replacement))?,
+    );
+    Ok(output)
 }
 
 pub fn atomic_write_if_unchanged(path: &Path, expected: &str, contents: &str) -> Result<()> {
@@ -250,6 +275,54 @@ pub fn remove_entry_type_fields(
         output.replace_range(edit.start..edit.end, &edit.replacement);
     }
     Ok((output, removed))
+}
+
+pub fn remove_fields(source: &str, field_names: &[&str]) -> Result<String> {
+    let spans = scan_entries(source)?;
+    let mut edits = Vec::new();
+    for entry in &spans {
+        for field in &entry.fields {
+            if field_names
+                .iter()
+                .any(|name| field.name.eq_ignore_ascii_case(name))
+            {
+                edits.push(Edit {
+                    start: field.segment_start,
+                    end: field.remove_end,
+                    replacement: String::new(),
+                });
+            }
+        }
+    }
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
+    let mut output = source.to_owned();
+    for edit in edits {
+        output.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    Ok(output)
+}
+
+pub fn remove_entry_types(source: &str, entry_types: &[&str]) -> Result<String> {
+    let spans = scan_entries(source)?;
+    let mut edits = spans
+        .iter()
+        .filter(|entry| {
+            entry_types
+                .iter()
+                .any(|name| source[entry.type_start..entry.type_end].eq_ignore_ascii_case(name))
+        })
+        .map(|entry| Edit {
+            start: entry.type_start.saturating_sub(1),
+            end: entry.close + 1,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
+    let mut output = source.to_owned();
+    for edit in edits {
+        output.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    Ok(output)
 }
 
 fn update_entry_fields_impl(
@@ -603,6 +676,27 @@ mod tests {
         let changed = added.replace("Quoted, title", "Different title");
         let records = parse(&changed).unwrap();
         assert_eq!(status(&records[1], &records).unwrap(), Status::Stale);
+    }
+
+    #[test]
+    fn history_link_is_not_covered_by_integrity() {
+        let record = parse("@article{key, title={A title}}").unwrap().remove(0);
+        let expected = hash(&record).unwrap();
+        let mut linked = record;
+        linked
+            .fields
+            .insert(PREVIOUS_FIELD.to_owned(), "bibversion:12345678".to_owned());
+        assert_eq!(hash(&linked).unwrap(), expected);
+    }
+
+    #[test]
+    fn workflow_entries_do_not_participate_in_integrity() {
+        for entry_type in ["bibsource", "bibversion"] {
+            let record = parse(&format!("@{entry_type}{{key, target={{paper}}}}"))
+                .unwrap()
+                .remove(0);
+            assert!(hash(&record).is_err());
+        }
     }
 
     #[test]

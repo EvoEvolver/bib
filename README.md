@@ -1,16 +1,16 @@
-# bib
+# biblock
 
-`bib` is a review-first CLI for BibTeX. It finds likely duplicate entries,
+`biblock` is a review-first CLI for BibTeX. It finds likely duplicate entries,
 reconciles metadata with literature providers, and attaches source-bound
 integrity markers. It is designed for agent-assisted bibliography maintenance:
-`bib` prepares evidence and candidates; a human or agent decides what to merge
+`biblock` prepares evidence and candidates; a human or agent decides what to merge
 or approve.
 
 The command is deliberately non-destructive by default. It never silently picks
 a metadata candidate, merges citation keys, or rewrites arbitrary BibTeX fields.
-Every integrity marker references a separate `@bibsource` provenance entry.
 Crossref is the default metadata backend; DOI content negotiation is also built
-in.
+in. Workflow state lives in a JSON `FILE.lock` sidecar, so the `.bib` remains
+standard, portable BibTeX.
 
 Provider results retain compact request, response-hash, and projection-hash
 receipts; response bodies are never embedded in the bibliography. Agent-created
@@ -23,36 +23,36 @@ Linux and macOS users can install the latest prebuilt release without Rust:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
+  https://raw.githubusercontent.com/EvoEvolver/biblock/main/install.sh | sh
 ```
 
 The installer supports Linux x86_64/ARM64 and macOS Intel/Apple Silicon. It
 detects the platform, downloads the GitHub Actions build, verifies its SHA-256
-checksum, and installs only the `bib` binary to `~/.local/bin`.
+checksum, and installs only the `biblock` binary to `~/.local/bin`.
 
 Choose another directory or a specific release with environment variables:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh |
-  BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.7.0 sh
+  https://raw.githubusercontent.com/EvoEvolver/biblock/main/install.sh |
+  BIBLOCK_INSTALL_DIR="$HOME/bin" BIBLOCK_VERSION=v0.9.0 sh
 ```
 
 Export the variables first when that reads more clearly:
 
 ```sh
-export BIB_INSTALL_DIR="$HOME/bin" BIB_VERSION=v0.7.0
+export BIBLOCK_INSTALL_DIR="$HOME/bin" BIBLOCK_VERSION=v0.9.0
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/EvoEvolver/bib/main/install.sh | sh
+  https://raw.githubusercontent.com/EvoEvolver/biblock/main/install.sh | sh
 ```
 
 Verify the installation:
 
 ```sh
-bib --version
+biblock --version
 ```
 
-`bib` is self-contained after installation and does not require Rust or Python.
+`biblock` is self-contained after installation and does not require Rust or Python.
 `jq` is optional: use it as a separate process when a pipeline needs JSON
 selection or transformation.
 
@@ -63,26 +63,26 @@ selection or transformation.
 Compare one or more BibTeX files and emit scored candidate pairs for review:
 
 ```sh
-bib dedupe references.bib other-references.bib
+biblock dedupe references.bib other-references.bib
 ```
 
 The result is JSON. Each pair includes the combined score, title and author
 scores, input files, citation keys, and complete fields:
 
 ```sh
-bib dedupe references.bib --compact > duplicate-candidates.json
+biblock dedupe references.bib --compact > duplicate-candidates.json
 ```
 
 Exit status is `0` when no pair meets the threshold, `3` when candidates need
 review, and `2` for invalid input. Adjust the threshold with `--min-score`
-(default `0.75`). `bib dedupe` never merges or removes entries.
+(default `0.75`). `biblock dedupe` never merges or removes entries.
 
 ### Reconcile metadata
 
 Verify a complete bibliography against Crossref and DOI.org, first as a dry run:
 
 ```sh
-bib source verify references.bib --all
+biblock source verify references.bib --all
 ```
 
 The JSON report distinguishes exact records that are ready, entries already
@@ -92,7 +92,7 @@ author search results are never selected automatically. Commit all successful
 exact matches with one atomic replacement:
 
 ```sh
-bib source verify references.bib --all --in-place
+biblock source verify references.bib --all --in-place
 ```
 
 The default fallback order is Crossref, then DOI content negotiation. Successful
@@ -103,15 +103,15 @@ matches can still be written when `--in-place` is present.
 Plan metadata replacements for selected entries:
 
 ```sh
-bib source plan references.bib --key watson1953
+biblock source plan references.bib --key watson1953
 ```
 
 Entries with a DOI receive an exact provider lookup. When an entry has a URL but
-no DOI, `bib` first looks for stable identifiers in the URL, redirects, publisher
+no DOI, `biblock` first looks for stable identifiers in the URL, redirects, publisher
 metadata, JSON-LD, and supported identifier APIs. Try resolution independently:
 
 ```sh
-bib source resolve 'https://doi.org/10.1038/171737a0'
+biblock source resolve 'https://doi.org/10.1038/171737a0'
 ```
 
 One unambiguous DOI can flow directly into the provider lookup. Otherwise `plan`
@@ -120,74 +120,54 @@ without disturbing comments, string declarations, citation keys, or local-only
 fields:
 
 ```sh
-bib source apply references.bib \
+biblock source apply references.bib \
   --key watson1953 \
   --id 10.1038/171737a0 \
   --add-integrity \
   --in-place
 ```
 
-The literature entry receives a source reference:
+The updated `.bib` contains only bibliographic fields. `references.bib.lock`
+records the provider identity, request metadata, response hash, projection hash,
+integrity approval, and history. Structured receipt values such as candidates,
+signals, and projections are native JSON values rather than JSON-encoded strings,
+so agents can query them directly with `jq`.
 
-```bibtex
-bibprovider = {crossref},
-bibproviderid = {10.1038/171737a0},
-bibsource = {bibsource:provider:...},
-integrity = {...}
-```
-
-The same file receives an independent compact receipt. It records where the
-metadata came from and binds the provider-controlled BibTeX fields to a stable
-projection hash without storing the HTTP response body:
-
-```bibtex
-@bibsource{bibsource:provider:...,
-  kind = {provider},
-  provider = {crossref},
-  providerid = {10.1038/171737a0},
-  requesturl = {https://api.crossref.org/works/10.1038%2F171737a0},
-  mediatype = {application/vnd.crossref-api-message+json},
-  responsesha256 = {...},
-  projection = {literature-record-v1},
-  projectionsha256 = {...},
-}
-```
-
-When a URL was resolved first, another `@bibsource` receipt records the input URL,
+When a URL was resolved first, another source object records the input URL,
 resolution method, matched identifier, signals, and any network-response hash.
-The provider receipt links to it through `resolution`. Inspect the chain as JSON:
+The provider source links to it through `resolution`. Inspect the chain as JSON:
 
 ```sh
-bib source trace references.bib --key watson1953
+biblock source trace references.bib --key watson1953
 ```
 
 Inspect the review status of every entry:
 
 ```sh
-bib integrity status references.bib
+biblock integrity status references.bib
 ```
 
 List just the citation keys that need attention:
 
 ```sh
-bib inspect references.bib --json |
+biblock inspect references.bib --json |
   jq -r '.[] | select(.integrity.status != "verified") | .id'
 ```
 
 When metadata was supplied by an agent rather than an API, say so explicitly:
 
 ```sh
-bib integrity add references.bib --key turing1936 \
+biblock integrity add references.bib --key turing1936 \
   --source agent --agent claude-code --in-place
 ```
 
-This creates `@bibsource{..., kind={agent}, actor={claude-code}, ...}`. A later
-content change makes integrity `stale`; missing, damaged, or inconsistent source
-evidence makes it `invalid`.
+This records an attributed agent source in the lockfile. A later content change
+makes integrity `stale`; missing, damaged, or inconsistent source evidence makes
+it `invalid`.
 
 ## Dedupe
 
-`bib dedupe` is a candidate generator, not a merge engine. It compares every
+`biblock dedupe` is a candidate generator, not a merge engine. It compares every
 pair of bibliography entries that has both `title` and `author` fields. TeX
 commands, braces, punctuation, case, and whitespace are normalized before
 comparison. The combined score is:
@@ -201,7 +181,7 @@ format differences such as `Smith, John` and `John Smith`. Results are sorted by
 score and preserve the complete input fields so an agent can inspect conflicts:
 
 ```sh
-bib dedupe references.bib --min-score 0.8 |
+biblock dedupe references.bib --min-score 0.8 |
   jq '.[] | {score, entries: [.entries[] | {file, id, title: .fields.title, doi: .fields.doi}]}'
 ```
 
@@ -211,7 +191,7 @@ ambiguous keys.
 
 ## Inspect and pipe
 
-`bib inspect` emits one JSON array. `--json` may be included to make that contract
+`biblock inspect` emits one JSON array. `--json` may be included to make that contract
 explicit in agent scripts. Each entry has this shape:
 
 ```json
@@ -231,67 +211,76 @@ explicit in agent scripts. Each entry has this shape:
       "key": null,
       "kind": null,
       "valid": false,
-      "error": "missing bibsource provenance reference"
+      "error": "missing provenance source reference"
     }
   }
 }
 ```
 
-`bib` does not embed jq or evaluate filters. Pipe its stable JSON output to `jq`,
+`biblock` does not embed jq or evaluate filters. Pipe its stable JSON output to `jq`,
 another JSON processor, or an agent harness:
 
 ```sh
 # List entries that still need review.
-bib inspect references.bib |
+biblock inspect references.bib |
   jq -r '.[] | select(.integrity.status != "verified") | .id'
 
 # Give an agent a compact review packet.
-bib inspect references.bib --compact |
+biblock inspect references.bib --compact |
   jq -c '[.[] | select(.integrity.status != "verified") |
     {id, type, title: .fields.title, doi: .fields.doi}]'
 
 # Select entries and feed their keys to a controlled write command.
-bib inspect references.bib |
+biblock inspect references.bib |
   jq -r '.[] | select(.fields.year == "2026") | .id' |
-  bib integrity add references.bib --keys-from - \
+  biblock integrity add references.bib --keys-from - \
     --source agent --agent claude-code --in-place
 
 # Read BibTeX from stdin.
-cat references.bib | bib inspect - | jq -r '.[].fields.doi // empty'
+cat references.bib | biblock inspect - | jq -r '.[].fields.doi // empty'
 ```
 
 Multiple files are combined into one array. Use `-` as a filename, or omit files,
-to read BibTeX from stdin. `inspect` never modifies input and omits `@bibsource`
-evidence entries from the array. Duplicate citation keys, including duplicates
+to read BibTeX from stdin. `inspect` never modifies input. Duplicate citation
+keys, including duplicates
 across input files, are rejected instead of producing ambiguous entries.
 
 There is intentionally no JSON-to-BibTeX conversion or arbitrary metadata editor.
-Edit bibliography data with the appropriate editor or domain tool. Only
-`bib source apply` and `bib integrity` write trusted workflow fields.
+Edit bibliography data with the appropriate editor or domain tool. `biblock` stores
+trusted workflow state in the lockfile rather than inventing BibTeX fields.
 
 ## Command reference
 
 | Command | Purpose |
 | --- | --- |
-| `bib inspect [FILE ...]` | Emit bibliography entries and trust state as JSON |
-| `bib dedupe [FILE ...]` | Find title-and-author duplicate candidates for review |
-| `bib source providers` | List installed metadata providers |
-| `bib source verify FILE --all` | Batch exact verification with provider fallback; report ambiguous candidates |
-| `bib source resolve URL` | Resolve a URL into auditable identifier candidates |
-| `bib source search QUERY` | Search a provider and return ranked common records |
-| `bib source plan FILE --key KEY` | Produce candidates and field-level diffs |
-| `bib source apply FILE --key KEY [--id ID]` | Apply one exact provider record and save a compact receipt |
-| `bib source apply FILE --key KEY --add-integrity` | Apply and add provider-backed integrity atomically |
-| `bib source trace FILE --key KEY` | Emit the provider and URL-resolution evidence chain |
-| `bib source strip-responses FILE` | Remove response bodies embedded by versions before 0.5 |
-| `bib integrity status FILE [--json]` | Report `verified`, `stale`, `unverified`, or `invalid` |
-| `bib integrity hash FILE KEY` | Print the expected SHA-256 value |
-| `bib integrity add FILE --key KEY --source SOURCE` | Add attributed or provider-backed integrity |
-| `bib integrity add FILE --keys-from - --source SOURCE` | Add integrity for newline-delimited keys from a pipeline |
-| `bib integrity remove FILE --key KEY [--in-place]` | Remove approval markers |
+| `biblock inspect [FILE ...]` | Emit bibliography entries and trust state as JSON |
+| `biblock dedupe [FILE ...]` | Find title-and-author duplicate candidates for review |
+| `biblock source providers` | List installed metadata providers |
+| `biblock source verify FILE --all` | Batch exact verification with provider fallback; report ambiguous candidates |
+| `biblock source web FILE --all` | Bind existing entry contents to fetched web-source receipts |
+| `biblock source resolve URL` | Resolve a URL into auditable identifier candidates |
+| `biblock source search QUERY` | Search a provider and return ranked common records |
+| `biblock source plan FILE --key KEY` | Produce candidates and field-level diffs |
+| `biblock source apply FILE --key KEY [--id ID]` | Apply one exact provider record and save a compact receipt |
+| `biblock source apply FILE --key KEY --add-integrity` | Apply and add provider-backed integrity atomically |
+| `biblock source trace FILE --key KEY` | Emit the provider and URL-resolution evidence chain |
+| `biblock source strip-responses FILE` | Remove response bodies embedded by versions before 0.5 |
+| `biblock integrity status FILE [--json]` | Report `verified`, `stale`, `unverified`, or `invalid` |
+| `biblock integrity hash FILE KEY` | Print the expected SHA-256 value |
+| `biblock integrity add FILE --key KEY --source SOURCE` | Add attributed or provider-backed integrity |
+| `biblock integrity add FILE --keys-from - --source SOURCE` | Add integrity for newline-delimited keys from a pipeline |
+| `biblock integrity remove FILE --key KEY [--in-place]` | Remove approval markers |
+| `biblock lock FILE --frozen` | Fail when the JSON lockfile is missing or stale |
+| `biblock lock FILE --sync --actor ACTOR` | Synchronize an external BibTeX edit without approving it |
+| `biblock history status FILE [--json]` | Validate revision hashes, snapshots, and links |
+| `biblock history log FILE --key KEY` | Emit one entry's revision chain as JSON |
+| `biblock history show FILE --revision REV` | Print a stored BibTeX snapshot |
+| `biblock history diff FILE --revision REV` | Compare a stored snapshot with the current entry |
+| `biblock history restore FILE --revision REV --in-place` | Restore and record a prior snapshot |
 
-Run `bib --help`, `bib source --help`, `bib integrity --help`, or a specific
-subcommand's `--help` for the complete option list.
+Run `biblock --help`, `biblock source --help`, `biblock integrity --help`, `biblock lock --help`,
+`biblock history --help`, or a specific subcommand's `--help` for the complete option
+list.
 
 ## Literature providers
 
@@ -301,17 +290,18 @@ All backends implement the same operations over a common literature record:
 - ranked bibliographic search;
 - mapping authorship, title, container, publication date, identifiers, and
   publication details into provider-neutral fields;
-- projection of that record into BibTeX plus `bibprovider` and `bibproviderid`.
+- projection of that record into standard BibTeX, with provider identity retained
+  in the lockfile.
 
 Crossref is selected by default. The `doi` backend performs exact lookup through
 DOI content negotiation with `Accept: application/x-bibtex`; it supports any DOI
 registration agency whose resolver supplies BibTeX. Use `--provider NAME` to
-select a backend; `bib source providers` lists the registry.
+select a backend; `biblock source providers` lists the registry.
 
 Set an email address for providers that support polite API identification:
 
 ```sh
-export BIB_MAILTO=researcher@example.org
+export BIBLOCK_MAILTO=researcher@example.org
 ```
 
 ### Agent review workflow
@@ -320,8 +310,8 @@ For entries with an existing DOI, a stored provider identifier, or a resolvable
 URL:
 
 ```sh
-bib source plan references.bib --key paper1
-bib source apply references.bib --key paper1 --add-integrity --in-place
+biblock source plan references.bib --key paper1
+biblock source apply references.bib --key paper1 --add-integrity --in-place
 ```
 
 URL resolution is conservative. A unique DOI from an explicit URL or supported
@@ -341,9 +331,29 @@ must not silently choose the highest provider score. Apply only an explicitly
 selected candidate:
 
 ```sh
-bib source apply references.bib \
-  --key paper1 --id 10.1234/chosen-record --in-place
+biblock source apply references.bib \
+  --key paper1 --id 10.1234/chosen-record \
+  --selected-by codex --add-integrity --in-place
 ```
+
+With `--selected-by`, `apply` reruns the bibliographic search and requires the
+chosen ID to be present in its candidates. It records a compact search receipt
+containing the query, candidates, request URL, and response hash; a selection
+receipt records the chosen ID and actor; and the exact provider receipt links to
+that selection. The final integrity remains provider-backed rather than becoming
+an agent assertion.
+
+For software, product pages, documentation, and other sources that do not have a
+literature-provider record, preserve the existing metadata and bind it to the
+source URL instead:
+
+```sh
+biblock source web references.bib --key product-page --in-place
+```
+
+The web receipt stores the input and final URLs, media type, response byte count,
+response SHA-256, and a hash of the BibTeX content. It does not embed the page
+body or claim that Crossref verified the entry.
 
 `apply` makes provider-controlled fields exactly match the deterministic
 projection produced during that provider request. Old provider fields absent
@@ -352,21 +362,21 @@ annotations remain. Without `--add-integrity`, the receipt is still saved and
 integrity remains a separate explicit step:
 
 ```sh
-bib integrity add references.bib --key paper1 --source provider --in-place
+biblock integrity add references.bib --key paper1 --source provider --in-place
 ```
 
 `source trace` exposes the compact evidence chain for an agent pipeline. It does
 not fetch the network again and never outputs a stored response body:
 
 ```sh
-bib source trace references.bib --key paper1 --compact | jq .
+biblock source trace references.bib --key paper1 --compact | jq .
 ```
 
-To remove response bodies previously written by `bib` 0.4 or older while keeping
+To remove response bodies previously written by `biblock` 0.4 or older while keeping
 their compact receipt metadata and citation references:
 
 ```sh
-bib source strip-responses references.bib --in-place
+biblock source strip-responses references.bib --in-place
 ```
 
 Use `source verify --all` for batch exact verification and a review report for
@@ -378,7 +388,7 @@ an agent has selected one of several search candidates explicitly.
 1. Find entries without a valid marker and create a review packet:
 
    ```sh
-   bib inspect references.bib |
+   biblock inspect references.bib |
      jq '[.[] | select(.integrity.status != "verified")]'
    ```
 
@@ -388,29 +398,29 @@ an agent has selected one of several search candidates explicitly.
    who supplied the assertion. Keys can be passed directly:
 
    ```sh
-   bib integrity add references.bib --key turing1936 --key shannon1948 \
+   biblock integrity add references.bib --key turing1936 --key shannon1948 \
      --source human --reviewer alice --in-place
    ```
 
    Or streamed one per line from a selection pipeline:
 
    ```sh
-   bib inspect references.bib |
+   biblock inspect references.bib |
      jq -r '.[] | select(.integrity.status == "unverified") | .id' |
-     bib integrity add references.bib --keys-from - \
+     biblock integrity add references.bib --keys-from - \
        --source human --reviewer alice --in-place
    ```
 
 4. Check the complete file:
 
    ```sh
-   bib integrity status references.bib
+   biblock integrity status references.bib
    ```
 
 Use `--all` only when every entry has been reviewed:
 
 ```sh
-bib integrity add references.bib --all \
+biblock integrity add references.bib --all \
   --source agent --agent claude-code --in-place
 ```
 
@@ -426,36 +436,94 @@ keeps an agent from marking unrelated entries during a partial review.
 Other integrity commands:
 
 ```sh
-bib integrity status references.bib --json
-bib integrity hash references.bib turing1936
-bib integrity remove references.bib --key turing1936 --in-place
+biblock integrity status references.bib --json
+biblock integrity hash references.bib turing1936
+biblock integrity remove references.bib --key turing1936 --in-place
 ```
 
 `integrity status` exits with `0` when every selected entry is verified, `3`
 when any selected entry is stale, unverified, or invalid, and `2` for an
 operational or input error. This makes it suitable for CI and agent loops.
 
+## JSON lockfile and edit history
+
+For `references.bib`, workflow state is stored in `references.bib.lock`. The
+JSON document has stable, key-sorted sections:
+
+- `lockfileVersion` and `toolVersion` describe the format and writer;
+- `bibliography.contentHash` binds the complete current bibliography;
+- `entries` binds each citation key to its canonical content, current source,
+  integrity approval, provider identity, snapshot, and history head;
+- `sources` stores content-addressed provider, web, resolution, search,
+  selection, agent, and human evidence;
+- `revisions` stores the content-addressed history DAG.
+
+The `.bib` never contains `integrity`, `bibsource`, `bibprovider`,
+`bibprevious`, `@bibsource`, or `@bibversion`. Deleting the lockfile leaves valid
+BibTeX, but deliberately discards all provenance, integrity, and history.
+Normally the lockfile should be committed with the project; omit it only from a
+submission bundle that accepts BibTeX but does not need the audit trail.
+
+```json
+{
+  "lockfileVersion": "1.0",
+  "toolVersion": "0.9.0",
+  "bibliography": { "contentHash": "..." },
+  "entries": {
+    "turing1936": {
+      "contentHash": "...",
+      "source": "bibsource:provider:...",
+      "integrity": { "contentHash": "...", "source": "bibsource:provider:..." },
+      "head": "rev:8f31c9d0"
+    }
+  },
+  "sources": {},
+  "revisions": {}
+}
+```
+
+Check it in CI or synchronize a change made by an external editor:
+
+```sh
+biblock lock references.bib --frozen
+biblock lock references.bib --sync --actor alice
+jq '.entries.turing1936, .sources, .revisions' references.bib.lock
+```
+
+An out-of-sync lockfile blocks mutating commands until `biblock lock --sync` records
+the external edit. Synchronization does not approve the new content or silently
+inherit integrity. Revision IDs use an eight-hex-digit prefix and retain the full
+SHA-256 in the revision object; collisions extend the new ID.
+
+Files written by versions before 0.9 are migrated on `biblock lock FILE --sync` or
+the next successful in-place edit: embedded workflow fields and `@bibsource`
+entries move into JSON and are removed from the `.bib`.
+
+```sh
+biblock history status references.bib
+biblock history log references.bib --key paper1
+biblock history show references.bib --revision 8f31c9d0
+biblock history diff references.bib --revision 8f31c9d0
+biblock history restore references.bib --revision 8f31c9d0 --in-place
+```
+
+`restore` is itself an ordinary recorded edit, so it can be reversed. Dry runs,
+stdout output, and no-op writes do not create revisions. During a write, the
+bibliography is replaced first and the lockfile last as the commit marker. An
+interrupted update is detected by the bibliography hash rather than being
+mistaken for verified state.
+
 ## Integrity format
 
-The marker uses this deterministic format:
+Integrity uses this deterministic format:
 
 1. Parse the entry and resolve BibTeX string macros.
 2. Lowercase the entry type and field names.
-3. Exclude the citation key and `integrity` field. Include the `bibsource`
-   reference, binding content integrity to one provenance entry.
+3. Exclude the citation key and all workflow metadata.
 4. Serialize the remaining fields plus `ENTRYTYPE` as compact, key-sorted,
    UTF-8 JSON.
-5. Store the lowercase SHA-256 digest in the `integrity` field.
-
-```bibtex
-@article{turing1936,
-  author = {Turing, Alan M.},
-  title = {On Computable Numbers},
-  year = {1936},
-  bibsource = {bibsource:agent:...},
-  integrity = {8f...},
-}
-```
+5. Store the lowercase SHA-256 digest under the entry's lockfile state, together
+   with the source object that authorized it.
 
 Verification also validates the referenced source. Provider sources bind the
 request metadata and response hash to a projection hash, then compare that hash

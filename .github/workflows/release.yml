@@ -40,19 +40,19 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          asset="bib-${{ matrix.target }}.tar.gz"
+          asset="biblock-${{ matrix.target }}.tar.gz"
           mkdir -p dist/package
-          cp "target/${{ matrix.target }}/release/bib" dist/package/bib
-          tar -C dist/package -czf "dist/${asset}" bib
+          cp "target/${{ matrix.target }}/release/biblock" dist/package/biblock
+          tar -C dist/package -czf "dist/${asset}" biblock
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "dist/${asset}" > "dist/${asset}.sha256"
           else
             shasum -a 256 "dist/${asset}" > "dist/${asset}.sha256"
           fi
-          "dist/package/bib" --version
+          "dist/package/biblock" --version
       - uses: actions/upload-artifact@v7
         with:
-          name: bib-${{ matrix.target }}
+          name: biblock-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v7
         with:
-          pattern: bib-*
+          pattern: biblock-*
           path: dist
           merge-multiple: true
       - name: Publish
@@ -76,5 +76,4 @@ jobs:
           --repo "${GITHUB_REPOSITORY}"
           --verify-tag
           --generate-notes
-          --title "bib ${GITHUB_REF_NAME}"
-
+          --title "biblock ${GITHUB_REF_NAME}"

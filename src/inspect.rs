@@ -25,7 +25,7 @@ struct EntryView<'a> {
 pub fn document(records: &[Record]) -> Result<serde_json::Value> {
     let entries = records
         .iter()
-        .filter(|record| !record.is_provenance())
+        .filter(|record| !record.is_system())
         .map(|record| {
             Ok(EntryView {
                 id: &record.entry_key,
@@ -52,8 +52,10 @@ mod tests {
     #[test]
     fn document_excludes_provenance_entries() {
         let records =
-            parse("@article{one, title={One}}\n@bibsource{source, kind={agent}, actor={test}}")
-                .unwrap();
+            parse(
+                "@article{one, title={One}}\n@bibsource{source, kind={agent}, actor={test}}\n@bibversion{bibversion:12345678, target={one}}",
+            )
+            .unwrap();
         let value = document(&records).unwrap();
         let entries = value.as_array().unwrap();
         assert_eq!(entries.len(), 1);

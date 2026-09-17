@@ -1,6 +1,7 @@
 pub mod bibtex;
 pub mod catalog;
 pub mod dedupe;
+pub mod history;
 pub mod inspect;
 pub mod integrity;
 pub mod provenance;

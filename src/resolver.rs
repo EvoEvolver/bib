@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_WEB_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,6 +74,16 @@ pub struct ResolutionReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct WebEvidence {
+    pub input_url: String,
+    pub request_url: String,
+    pub final_url: String,
+    pub media_type: String,
+    pub response_sha256: String,
+    pub response_bytes: usize,
+}
+
 impl ResolutionReport {
     pub fn exact_candidate(&self) -> Result<&ResolutionCandidate> {
         match self.candidates.as_slice() {
@@ -111,7 +122,7 @@ pub fn resolve_url(input: &str) -> Result<ResolutionReport> {
         return resolve_arxiv(&input_string, &arxiv_id);
     }
 
-    let fetched = fetch_page(input_url)?;
+    let fetched = fetch_page(input_url, MAX_RESPONSE_BYTES)?;
     let decoded_final = percent_decode_str(&fetched.final_url).decode_utf8_lossy();
     let mut discovered: BTreeMap<String, (ResolutionConfidence, BTreeSet<String>)> =
         BTreeMap::new();
@@ -157,10 +168,23 @@ pub fn arxiv_id_in_url(input_url: &str) -> Option<String> {
     find_arxiv_id(input_url)
 }
 
+pub fn fetch_web_evidence(input: &str) -> Result<WebEvidence> {
+    let input_url = normalize_input_url(input)?;
+    let fetched = fetch_page(input_url, MAX_WEB_EVIDENCE_BYTES)?;
+    Ok(WebEvidence {
+        input_url: input.trim().to_owned(),
+        request_url: fetched.request_url,
+        final_url: fetched.final_url,
+        media_type: fetched.media_type,
+        response_sha256: sha256(&fetched.body),
+        response_bytes: fetched.body.len(),
+    })
+}
+
 fn resolve_arxiv(input_url: &str, arxiv_id: &str) -> Result<ResolutionReport> {
     let mut api_url = Url::parse("https://export.arxiv.org/api/query")?;
     api_url.query_pairs_mut().append_pair("id_list", arxiv_id);
-    let fetched = fetch_page(api_url)?;
+    let fetched = fetch_page(api_url, MAX_RESPONSE_BYTES)?;
     let mut discovered = BTreeMap::new();
     for doi in dois_from_arxiv_atom(&fetched.body)? {
         add_discovery(
@@ -302,7 +326,7 @@ fn normalize_input_url(input: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn fetch_page(mut url: Url) -> Result<FetchedPage> {
+fn fetch_page(mut url: Url, max_response_bytes: u64) -> Result<FetchedPage> {
     let initial = url.to_string();
     for redirect in 0..=MAX_REDIRECTS {
         let (host, addresses) = public_addresses(&url)?;
@@ -311,7 +335,7 @@ fn fetch_page(mut url: Url) -> Result<FetchedPage> {
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!(
-                "bib/{} (https://github.com/EvoEvolver/bib)",
+                "biblock/{} (https://github.com/EvoEvolver/biblock)",
                 env!("CARGO_PKG_VERSION")
             ))
             .resolve_to_addrs(&host, &addresses)
@@ -349,9 +373,9 @@ fn fetch_page(mut url: Url) -> Result<FetchedPage> {
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES)
+            .is_some_and(|length| length > max_response_bytes)
         {
-            bail!("URL response exceeds {MAX_RESPONSE_BYTES} bytes");
+            bail!("URL response exceeds {max_response_bytes} bytes");
         }
         let media_type = response
             .headers()
@@ -365,11 +389,11 @@ fn fetch_page(mut url: Url) -> Result<FetchedPage> {
             .to_ascii_lowercase();
         let mut body = Vec::new();
         response
-            .take(MAX_RESPONSE_BYTES + 1)
+            .take(max_response_bytes + 1)
             .read_to_end(&mut body)
             .with_context(|| format!("could not read literature URL response from {url}"))?;
-        if body.len() as u64 > MAX_RESPONSE_BYTES {
-            bail!("URL response exceeds {MAX_RESPONSE_BYTES} bytes");
+        if body.len() as u64 > max_response_bytes {
+            bail!("URL response exceeds {max_response_bytes} bytes");
         }
         return Ok(FetchedPage {
             request_url: initial,

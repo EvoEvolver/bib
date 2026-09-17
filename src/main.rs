@@ -5,74 +5,89 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use bib_cli::bibtex::{Record, parse};
-use bib_cli::catalog::{
+use biblock_cli::bibtex::{Record, parse, render};
+use biblock_cli::catalog::{
     BibliographicQuery, Candidate, FieldChange, LiteratureIdentifier, LiteratureRecord,
     PROVIDER_FIELD, PROVIDER_ID_FIELD, changes,
 };
-use bib_cli::dedupe::{self, LocatedRecord};
-use bib_cli::inspect;
-use bib_cli::integrity::{
-    Status, atomic_write_if_unchanged, hash, remove_entry_type_fields, status, update_entry_fields,
-    update_entry_fields_exact, update_source,
+use biblock_cli::dedupe::{self, LocatedRecord};
+use biblock_cli::history;
+use biblock_cli::inspect;
+use biblock_cli::integrity::{
+    Status, hash, remove_entry_type_fields, status, update_entry_fields, update_entry_fields_exact,
+    update_source,
 };
-use bib_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SOURCE_TYPE, SourceKind};
-use bib_cli::providers::{self, DEFAULT_PROVIDER};
-use bib_cli::resolver::{self, ResolutionReport};
+use biblock_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SOURCE_TYPE, SourceKind};
+use biblock_cli::providers::{self, DEFAULT_PROVIDER};
+use biblock_cli::resolver::{self, ResolutionReport};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-const LONG_ABOUT: &str = "Resolve literature URLs, reconcile BibTeX with pluggable metadata providers, inspect entries as JSON, find likely duplicates, and add source-bound integrity markers. Provider receipts store response and projection hashes, never response bodies. Every integrity marker references a separate @bibsource entry. Crossref is the default provider; DOI content negotiation is also built in.";
+const LONG_ABOUT: &str = "Resolve literature URLs, reconcile BibTeX with pluggable metadata providers, inspect entries as JSON, find likely duplicates, and maintain source-bound verification in a JSON .bib.lock sidecar. The bibliography remains standard BibTeX. Crossref is the default provider; DOI content negotiation is also built in.";
 
 const AFTER_HELP: &str = r#"INSPECT AND PIPE
   Emit bibliography entries and integrity state as one JSON array:
-    bib inspect refs.bib
+    biblock inspect refs.bib
 
   Use an external JSON processor when selection or transformation is useful:
-    bib inspect refs.bib | jq -r '.[] | select(.integrity.status != "verified") | .id'
+    biblock inspect refs.bib | jq -r '.[] | select(.integrity.status != "verified") | .id'
 
   Feed selected citation keys back to a controlled write command:
-    bib inspect refs.bib | jq -r '.[].id' |
-      bib integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place
+    biblock inspect refs.bib | jq -r '.[].id' |
+      biblock integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place
 
 DEDUPLICATION
   Find likely duplicate pairs using normalized title and author similarity:
-    bib dedupe refs.bib
+    biblock dedupe refs.bib
 
   Results include component scores and complete entry fields for agent review.
-  bib never merges or removes entries automatically.
+  biblock never merges or removes entries automatically.
 
 LITERATURE SOURCES
   Providers map their native metadata into one common literature record. Crossref is
   the default backend. Verify exact identifiers across a complete file, then inspect
   any ambiguous candidates in the JSON report:
-    bib source verify refs.bib --all
-    bib source verify refs.bib --all --in-place
+    biblock source verify refs.bib --all
+    biblock source verify refs.bib --all --in-place
 
   For explicit candidate review and key-by-key reconciliation:
-    bib source plan refs.bib --key paper1
-    bib source apply refs.bib --key paper1 --in-place
+    biblock source plan refs.bib --key paper1
+    biblock source apply refs.bib --key paper1 --in-place
 
   A URL is resolved to a stable DOI from the URL itself, redirects, publisher
   metadata, JSON-LD, or an official identifier API:
-    bib source resolve 'https://doi.org/10.1234/example'
+    biblock source resolve 'https://doi.org/10.1234/example'
 
-  An entry with a DOI is looked up exactly. Without one, bib tries its URL before
+  An entry with a DOI is looked up exactly. Without one, biblock tries its URL before
   returning ranked candidates. Review ambiguous results and pass an id explicitly:
-    bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
+    biblock source apply refs.bib --key paper1 --id 10.1234/example --in-place
 
-  Apply writes a separate @bibsource receipt containing response and projection
-  hashes, request URL, media type, provider, and record id. Response bodies are
-  not embedded in BibTeX. To reconcile and seal an exact provider projection:
-    bib source apply refs.bib --key paper1 --add-integrity --in-place
+  Apply writes request, response-hash, projection-hash, provider, and record-id
+  evidence to FILE.lock. Response bodies and workflow fields are never embedded
+  in BibTeX. To reconcile and seal an exact provider projection:
+    biblock source apply refs.bib --key paper1 --add-integrity --in-place
 
   Use --provider doi for DOI content negotiation (raw application/x-bibtex) or
   --provider crossref for the Crossref works API (raw JSON).
 
 SCOPE
-  bib deliberately does not provide arbitrary metadata editing or an embedded jq
+  biblock deliberately does not provide arbitrary metadata editing or an embedded jq
   implementation. Use normal editors, domain tools, and shell pipelines for data
-  processing. Only source and integrity commands write trusted workflow fields.
+  processing. Source and integrity commands keep workflow state in FILE.lock;
+  history restore only restores a recorded snapshot and records that edit again.
+
+LOCKFILE
+  FILE.lock is deterministic, JSON, and designed for jq and agents. The .bib is
+  valid without it, but deleting it discards provenance, integrity, and history.
+    biblock lock refs.bib --frozen
+    biblock lock refs.bib --sync --actor alice
+
+EDIT HISTORY
+  Every --in-place edit writes the prior entry into FILE.lock. The current head
+  is stored only in JSON; the BibTeX remains clean. Dry runs never write history.
+    biblock history status refs.bib
+    biblock history log refs.bib --key paper1
+    biblock history restore refs.bib --revision 8f31c9d0 --in-place
 
 INTEGRITY
   verified    Stored integrity matches the current covered fields.
@@ -86,20 +101,19 @@ INTEGRITY
 EXIT STATUS
   0  Success (or every selected entry is verified for 'integrity status')
   2  Invalid input or operational error
-  3  Review or selection is needed, or integrity is stale/unverified."#;
+  3  Review or selection is needed, or lock/integrity validation failed."#;
 
 const INSPECT_AFTER_HELP: &str = r#"OUTPUT
-  inspect writes one JSON array containing only bibliography entries. @bibsource
-  evidence entries are omitted, but each bibliography entry includes a summary of
-  its integrity and provenance state.
+  inspect writes one JSON array containing bibliography entries plus integrity and
+  provenance summaries loaded from FILE.lock when present.
 
 PIPELINE EXAMPLES
-  bib inspect refs.bib | jq -r '.[].id'
-  bib inspect refs.bib --compact |
+  biblock inspect refs.bib | jq -r '.[].id'
+  biblock inspect refs.bib --compact |
     jq -r '.[] | select(.integrity.status != "verified") | .id'
-  cat refs.bib | bib inspect -
+  cat refs.bib | biblock inspect -
 
-jq is optional and external. bib itself does not evaluate filters or turn edited
+jq is optional and external. biblock itself does not evaluate filters or turn edited
 JSON back into BibTeX."#;
 
 const DEDUPE_AFTER_HELP: &str = r#"SCORING
@@ -114,7 +128,7 @@ const DEDUPE_AFTER_HELP: &str = r#"SCORING
 OUTPUT
   Emit a JSON array of candidate pairs sorted by descending score. Every entry
   includes its input file, citation key, type, and fields so an agent can decide
-  whether and how to merge it. bib never merges or removes entries automatically.
+  whether and how to merge it. biblock never merges or removes entries automatically.
 
 EXIT STATUS
   0  No candidate pairs met the threshold
@@ -124,43 +138,49 @@ EXIT STATUS
 const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
   1. Batch exact DOI and URL verification with Crossref-to-DOI fallback. This
      writes nothing without --in-place and never selects search candidates:
-       bib source verify refs.bib --all
-       bib source verify refs.bib --all --in-place
+       biblock source verify refs.bib --all
+       biblock source verify refs.bib --all --in-place
   2. Plan replacements that still need explicit candidate review:
-       bib source plan refs.bib --key paper1
+       biblock source plan refs.bib --key paper1
      Multiple keys may come from a newline-delimited pipeline:
-       bib inspect refs.bib | jq -r '.[].id' |
-         bib source plan refs.bib --keys-from -
+       biblock inspect refs.bib | jq -r '.[].id' |
+         biblock source plan refs.bib --keys-from -
   3. For a DOI-backed exact match, apply it directly. For search results, pass the
-     chosen candidate id explicitly with --id:
-       bib source apply refs.bib --key paper1 --id 10.1234/example --in-place
+     chosen candidate id and selector identity. This records the search response,
+     candidate set, selection, and exact provider lookup as one evidence chain:
+       biblock source apply refs.bib --key paper1 --id 10.1234/example \
+         --selected-by codex --add-integrity --in-place
   4. Either add provider-backed integrity atomically with apply:
-       bib source apply refs.bib --key paper1 --add-integrity --in-place
+       biblock source apply refs.bib --key paper1 --add-integrity --in-place
      or record an attributed review separately:
-       bib integrity add refs.bib --key paper1 --source agent --agent MODEL --in-place
+       biblock integrity add refs.bib --key paper1 --source agent --agent MODEL --in-place
 
 PROVENANCE
-  Apply creates a compact @bibsource receipt with the request URL, media type,
+  Apply creates a compact receipt in FILE.lock with the request URL, media type,
   response SHA-256, and provider-projection SHA-256. It never embeds response
-  bodies. The literature entry references this receipt through bibsource.
+  bodies or workflow fields in the bibliography.
 
   Entries without a DOI are first resolved from their URL. Conflicting identifiers
   require review and are never selected by score. Crossref is the default; doi is
-  exact-lookup-only. Set BIB_MAILTO or pass --mailto for polite API identification.
+  exact-lookup-only. Set BIBLOCK_MAILTO or pass --mailto for polite API identification.
   Inspect the full evidence chain with:
-    bib source trace refs.bib --key paper1"#;
+    biblock source trace refs.bib --key paper1
+
+  Entries whose authority is a product page, documentation page, or other URL can
+  retain their existing fields while recording a response-bound web receipt:
+    biblock source web refs.bib --key product --in-place"#;
 
 const INTEGRITY_AFTER_HELP: &str = r#"SOURCE MODES
-  provider  Reuse @bibsource evidence created by `bib source apply`. Receipt key,
+  provider  Reuse evidence in FILE.lock created by `biblock source apply`. Receipt key,
             response hash, provider identity, and projected fields are validated.
-  agent     Create @bibsource kind={agent}; requires --agent MODEL_OR_AGENT_ID.
-  human     Create @bibsource kind={human}; requires --reviewer REVIEWER_ID.
+  agent     Record kind=agent in FILE.lock; requires --agent MODEL_OR_AGENT_ID.
+  human     Record kind=human in FILE.lock; requires --reviewer REVIEWER_ID.
 
 EXAMPLES
-  bib integrity add refs.bib --key paper1 --source provider --in-place
-  bib integrity add refs.bib --key draft1 --source agent --agent claude-code --in-place
-  bib integrity add refs.bib --key paper1 --source human --reviewer alice --in-place
-  jq -r '.[].id' review.json | bib integrity add refs.bib --keys-from - \
+  biblock integrity add refs.bib --key paper1 --source provider --in-place
+  biblock integrity add refs.bib --key draft1 --source agent --agent claude-code --in-place
+  biblock integrity add refs.bib --key paper1 --source human --reviewer alice --in-place
+  jq -r '.[].id' review.json | biblock integrity add refs.bib --keys-from - \
     --source human --reviewer alice --in-place
 
 Agent and human modes are attributed assertions, not cryptographic identities.
@@ -188,10 +208,10 @@ const VERIFY_AFTER_HELP: &str = r#"WORKFLOW
   return ranked candidates but are never selected automatically.
 
   Dry-run and inspect the JSON report:
-    bib source verify refs.bib --all
+    biblock source verify refs.bib --all
 
   Reconcile exact records, add provider integrity, and write once:
-    bib source verify refs.bib --all --in-place
+    biblock source verify refs.bib --all --in-place
 
   The default provider order is crossref,doi. Override it with a comma-separated
   list such as --providers doi,crossref.
@@ -203,7 +223,7 @@ EXIT STATUS
 
 #[derive(Parser)]
 #[command(
-    name = "bib",
+    name = "biblock",
     version,
     about = "Reconcile, inspect, and verify BibTeX",
     long_about = LONG_ABOUT,
@@ -224,6 +244,40 @@ enum Command {
     Source(SourceArgs),
     /// Inspect, add, or remove integrity markers.
     Integrity(IntegrityArgs),
+    /// Inspect or restore the append-only edit history.
+    History(HistoryArgs),
+    /// Check or synchronize the JSON sidecar lockfile.
+    Lock(LockArgs),
+}
+
+#[derive(Args, Clone, Default)]
+struct HistoryWriteArgs {
+    /// Override the default FILE.lock path.
+    #[arg(long = "lockfile", value_name = "FILE")]
+    history: Option<PathBuf>,
+    /// Actor recorded for the edit. Defaults to biblock/VERSION.
+    #[arg(long = "lock-actor", env = "BIBLOCK_ACTOR")]
+    history_actor: Option<String>,
+}
+
+#[derive(Args)]
+struct LockArgs {
+    file: PathBuf,
+    /// Update or create the lockfile from the current bibliography.
+    #[arg(long, conflicts_with = "frozen")]
+    sync: bool,
+    /// Fail if the lockfile is missing or out of sync.
+    #[arg(long, conflicts_with = "sync")]
+    frozen: bool,
+    /// Preview lock status without writing.
+    #[arg(long, requires = "sync")]
+    dry_run: bool,
+    /// Override the default FILE.lock path.
+    #[arg(long, value_name = "FILE")]
+    lockfile: Option<PathBuf>,
+    /// Actor recorded for an external synchronization.
+    #[arg(long, env = "BIBLOCK_ACTOR")]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -289,8 +343,31 @@ enum SourceCommand {
         #[arg(short, long)]
         compact: bool,
         /// Email sent to providers that support polite API identification.
-        #[arg(long, env = "BIB_MAILTO")]
+        #[arg(long, env = "BIBLOCK_MAILTO")]
         mailto: Option<String>,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
+    },
+    /// Verify existing entry contents against fetched web-source receipts.
+    Web {
+        file: PathBuf,
+        /// Citation key to verify. Repeat for multiple entries.
+        #[arg(short, long)]
+        key: Vec<String>,
+        /// Read citation keys, one per line. Use `-` for stdin.
+        #[arg(long, value_name = "FILE")]
+        keys_from: Option<PathBuf>,
+        /// Verify every bibliography entry that has a URL.
+        #[arg(long, conflicts_with_all = ["key", "keys_from"])]
+        all: bool,
+        /// Atomically write all successful receipts in one replacement.
+        #[arg(short, long)]
+        in_place: bool,
+        /// Emit compact JSON.
+        #[arg(short, long)]
+        compact: bool,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
     },
     /// Resolve a literature URL into evidence-backed identifier candidates.
     #[command(after_help = RESOLVE_AFTER_HELP)]
@@ -314,7 +391,7 @@ enum SourceCommand {
         #[arg(short, long)]
         compact: bool,
         /// Email sent to providers that support polite API identification.
-        #[arg(long, env = "BIB_MAILTO")]
+        #[arg(long, env = "BIBLOCK_MAILTO")]
         mailto: Option<String>,
     },
     /// Plan provider replacements for explicitly selected BibTeX entries.
@@ -339,7 +416,7 @@ enum SourceCommand {
         #[arg(short, long)]
         compact: bool,
         /// Email sent to providers that support polite API identification.
-        #[arg(long, env = "BIB_MAILTO")]
+        #[arg(long, env = "BIBLOCK_MAILTO")]
         mailto: Option<String>,
     },
     /// Apply one exact provider record to one BibTeX entry.
@@ -351,6 +428,12 @@ enum SourceCommand {
         /// Exact provider id. If omitted, uses stored provenance, DOI, or a resolved URL.
         #[arg(long)]
         id: Option<String>,
+        /// Record an auditable search-and-selection chain for an explicit id.
+        #[arg(long, requires = "id", value_name = "ACTOR")]
+        selected_by: Option<String>,
+        /// Candidate count retained when recording a selection.
+        #[arg(long, default_value_t = 5, requires = "selected_by", value_parser = parse_limit)]
+        search_limit: usize,
         /// Metadata provider name. Defaults to stored provenance, then Crossref.
         #[arg(long)]
         provider: Option<String>,
@@ -361,8 +444,10 @@ enum SourceCommand {
         #[arg(long)]
         add_integrity: bool,
         /// Email sent to providers that support polite API identification.
-        #[arg(long, env = "BIB_MAILTO")]
+        #[arg(long, env = "BIBLOCK_MAILTO")]
         mailto: Option<String>,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
     },
     /// Show the provider and URL-resolution evidence chain for one entry.
     #[command(after_help = TRACE_AFTER_HELP)]
@@ -375,12 +460,14 @@ enum SourceCommand {
         #[arg(short, long)]
         compact: bool,
     },
-    /// Remove response bodies embedded by bib versions before 0.5.
+    /// Remove response bodies embedded by biblock versions before 0.5.
     StripResponses {
         file: PathBuf,
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
         in_place: bool,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
     },
 }
 
@@ -432,6 +519,8 @@ enum IntegrityCommand {
         /// Human reviewer identifier, required with `--source human`.
         #[arg(long)]
         reviewer: Option<String>,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
     },
     /// Remove integrity from selected entries.
     Remove {
@@ -448,6 +537,64 @@ enum IntegrityCommand {
         /// Atomically update FILE instead of writing the result to stdout.
         #[arg(short, long)]
         in_place: bool,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
+    },
+}
+
+#[derive(Args)]
+struct HistoryArgs {
+    #[command(subcommand)]
+    command: HistoryCommand,
+}
+
+#[derive(Subcommand)]
+enum HistoryCommand {
+    /// Validate revision hashes, snapshots, and current history links.
+    Status {
+        file: PathBuf,
+        #[arg(long = "lockfile", value_name = "FILE")]
+        history: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the revision chain for one entry as JSON.
+    Log {
+        file: PathBuf,
+        #[arg(short, long)]
+        key: String,
+        #[arg(long = "lockfile", value_name = "FILE")]
+        history: Option<PathBuf>,
+        #[arg(short, long)]
+        compact: bool,
+    },
+    /// Print the complete BibTeX snapshot stored by a revision.
+    Show {
+        file: PathBuf,
+        #[arg(long)]
+        revision: String,
+        #[arg(long = "lockfile", value_name = "FILE")]
+        history: Option<PathBuf>,
+    },
+    /// Compare a stored revision with the current entry as JSON.
+    Diff {
+        file: PathBuf,
+        #[arg(long)]
+        revision: String,
+        #[arg(long = "lockfile", value_name = "FILE")]
+        history: Option<PathBuf>,
+        #[arg(short, long)]
+        compact: bool,
+    },
+    /// Restore a stored snapshot; the restore is itself recorded.
+    Restore {
+        file: PathBuf,
+        #[arg(long)]
+        revision: String,
+        #[arg(short, long)]
+        in_place: bool,
+        #[command(flatten)]
+        history_write: HistoryWriteArgs,
     },
 }
 
@@ -504,11 +651,21 @@ struct VerifyRow {
     candidates: Vec<PlannedCandidate>,
 }
 
+#[derive(Serialize)]
+struct WebRow {
+    id: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<resolver::WebEvidence>,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("bib: {error:#}");
+            eprintln!("biblock: {error:#}");
             ExitCode::from(2)
         }
     }
@@ -535,7 +692,25 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Command::Source(args) => run_source(args.command),
         Command::Integrity(args) => run_integrity(args.command),
+        Command::History(args) => run_history(args.command),
+        Command::Lock(args) => run_lock(args),
     }
+}
+
+fn run_lock(args: LockArgs) -> Result<u8> {
+    let report = if args.sync && !args.frozen {
+        history::sync(
+            &args.file,
+            args.lockfile.as_deref(),
+            false,
+            args.dry_run,
+            args.actor.as_deref(),
+        )?
+    } else {
+        history::status(&args.file, args.lockfile.as_deref())?
+    };
+    print_serializable(&report, false)?;
+    Ok(if report.valid { 0 } else { 3 })
 }
 
 fn run_source(command: SourceCommand) -> Result<u8> {
@@ -563,6 +738,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             in_place,
             compact,
             mailto,
+            history_write,
         } => run_verify(
             &file,
             merge_keys(key, keys_from)?,
@@ -572,6 +748,23 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             in_place,
             compact,
             mailto.as_deref(),
+            &history_write,
+        ),
+        SourceCommand::Web {
+            file,
+            key,
+            keys_from,
+            all,
+            in_place,
+            compact,
+            history_write,
+        } => run_web(
+            &file,
+            merge_keys(key, keys_from)?,
+            all,
+            in_place,
+            compact,
+            &history_write,
         ),
         SourceCommand::Resolve { url, compact } => {
             let report = resolver::resolve_url(&url)?;
@@ -587,9 +780,9 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             mailto,
         } => {
             let backend = providers::open(&provider, mailto.as_deref())?;
-            let candidates = backend.search(&BibliographicQuery { citation: query }, limit)?;
-            print_serializable(&candidates, compact)?;
-            Ok(if candidates.is_empty() { 3 } else { 0 })
+            let search = backend.search(&BibliographicQuery { citation: query }, limit)?;
+            print_serializable(&search.candidates, compact)?;
+            Ok(if search.candidates.is_empty() { 3 } else { 0 })
         }
         SourceCommand::Plan {
             file,
@@ -734,14 +927,15 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                     needs_review = true;
                     let query = BibliographicQuery::from_record(record);
                     match backend.search(&query, limit) {
-                        Ok(candidates) => rows.push(PlanRow {
+                        Ok(search) => rows.push(PlanRow {
                             id: record.entry_key.clone(),
                             provider: provider_name.clone(),
                             status: "needs-selection",
                             query: Some(query.citation),
                             error: None,
                             resolution: None,
-                            candidates: candidates
+                            candidates: search
+                                .candidates
                                 .into_iter()
                                 .map(|candidate| planned_candidate(record, candidate))
                                 .collect(),
@@ -765,10 +959,13 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             file,
             key,
             id,
+            selected_by,
+            search_limit,
             provider,
             in_place,
             add_integrity,
             mailto,
+            history_write,
         } => {
             let source = read_file(&file)?;
             let records = parse(&source)?;
@@ -778,6 +975,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 .with_context(|| format!("citation key not found: {key}"))?;
             let (provider_name, stored_id) = source_identity(record, provider.as_deref());
             let mut resolution_candidate = None;
+            let explicit_id = id.clone();
             let identifier = id
                 .map(LiteratureIdentifier::ProviderId)
                 .or_else(|| stored_id.map(LiteratureIdentifier::ProviderId))
@@ -814,10 +1012,32 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                         }
                     }
                 })
+                .or_else(|| {
+                    let (identifier, candidate) = identifier_from_bibtex_fields(record)?;
+                    resolution_candidate = Some(candidate);
+                    Some(identifier)
+                })
                 .context(
                     "no exact provider id or uniquely resolved DOI; use source plan/resolve, then pass --id",
                 )?;
             let backend = providers::open(&provider_name, mailto.as_deref())?;
+            let selection_evidence = if let Some(actor) = selected_by.as_deref() {
+                let selected_id = explicit_id
+                    .as_deref()
+                    .context("--selected-by requires an explicit --id")?;
+                let query = BibliographicQuery::from_record(record);
+                let search = backend.search(&query, search_limit)?;
+                let search_source =
+                    provenance::search_source(record, &query, &search, &provider_name)?;
+                let selection_source =
+                    provenance::selection_source(&search_source, selected_id, actor)?;
+                Some(SelectionEvidence {
+                    search: search_source,
+                    selection: selection_source,
+                })
+            } else {
+                None
+            };
             let fetched = backend.lookup(&identifier)?;
             let provider_id = fetched.record.id.clone();
             let (output, receipt_key) = reconcile_fetched(
@@ -825,10 +1045,11 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 &key,
                 &fetched,
                 resolution_candidate.as_ref(),
+                selection_evidence.as_ref(),
                 add_integrity,
             )?;
             if in_place {
-                atomic_write_if_unchanged(&file, &source, &output)?;
+                commit_edit(&file, &source, &output, "source-apply", &history_write)?;
                 eprintln!(
                     "updated {key} from {provider_name}:{} in {}; receipt recorded as {}{}",
                     provider_id,
@@ -841,7 +1062,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                     }
                 );
             } else {
-                print!("{output}");
+                print!("{}", history::clean_source(&output)?);
             }
             Ok(0)
         }
@@ -850,29 +1071,118 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             let records = parse(&source)?;
             let record = records
                 .iter()
-                .find(|record| !record.is_provenance() && record.entry_key == key)
+                .find(|record| !record.is_system() && record.entry_key == key)
                 .with_context(|| format!("citation key not found: {key}"))?;
             let trace = provenance::trace(record, &records)
                 .with_context(|| format!("provider evidence for {key} is not valid"))?;
             print_serializable(&trace, compact)?;
             Ok(0)
         }
-        SourceCommand::StripResponses { file, in_place } => {
+        SourceCommand::StripResponses {
+            file,
+            in_place,
+            history_write,
+        } => {
             let source = read_file(&file)?;
             let (output, removed) =
                 remove_entry_type_fields(&source, SOURCE_TYPE, &["response", "responseencoding"])?;
             if in_place {
-                atomic_write_if_unchanged(&file, &source, &output)?;
+                commit_edit(
+                    &file,
+                    &source,
+                    &output,
+                    "source-strip-responses",
+                    &history_write,
+                )?;
                 eprintln!(
                     "removed {removed} legacy response field(s) from {}",
                     file.display()
                 );
             } else {
-                print!("{output}");
+                print!("{}", history::clean_source(&output)?);
             }
             Ok(0)
         }
     }
+}
+
+fn run_web(
+    file: &Path,
+    keys: Vec<String>,
+    all: bool,
+    in_place: bool,
+    compact: bool,
+    history_write: &HistoryWriteArgs,
+) -> Result<u8> {
+    let original = read_file(file)?;
+    let initial_records = parse(&original)?;
+    let selected = selected_keys(&initial_records, keys, all)?;
+    let mut output = original.clone();
+    let mut rows = Vec::new();
+    let mut needs_review = false;
+
+    for key in selected {
+        let records = parse(&output)?;
+        let record = records
+            .iter()
+            .find(|record| !record.is_system() && record.entry_key == key)
+            .cloned()
+            .with_context(|| format!("citation key not found: {key}"))?;
+        if status(&record, &records)? == Status::Verified {
+            rows.push(WebRow {
+                id: key,
+                status: "already-verified",
+                error: None,
+                evidence: None,
+            });
+            continue;
+        }
+        let Some(url) = record.fields.get("url") else {
+            needs_review = true;
+            rows.push(WebRow {
+                id: key,
+                status: "missing-url",
+                error: Some("entry has no URL".to_owned()),
+                evidence: None,
+            });
+            continue;
+        };
+        match resolver::fetch_web_evidence(url) {
+            Ok(evidence) => {
+                let source = provenance::web_source(&record, &evidence)?;
+                output = provenance::append_source(&output, &source, &records)?;
+                output = update_entry_fields(
+                    &output,
+                    &key,
+                    &record.entry_type,
+                    &BTreeMap::from([(SOURCE_FIELD.to_owned(), source.entry_key)]),
+                )?;
+                let records = parse(&output)?;
+                output = update_source(&output, &records, &BTreeSet::from([key.clone()]), false)?;
+                rows.push(WebRow {
+                    id: key,
+                    status: if in_place { "verified" } else { "ready" },
+                    error: None,
+                    evidence: Some(evidence),
+                });
+            }
+            Err(error) => {
+                needs_review = true;
+                rows.push(WebRow {
+                    id: key,
+                    status: "fetch-error",
+                    error: Some(format!("{error:#}")),
+                    evidence: None,
+                });
+            }
+        }
+    }
+
+    if in_place && output != original {
+        commit_edit(file, &original, &output, "source-web", history_write)?;
+    }
+    print_serializable(&rows, compact)?;
+    Ok(if needs_review { 3 } else { 0 })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -885,6 +1195,7 @@ fn run_verify(
     in_place: bool,
     compact: bool,
     mailto: Option<&str>,
+    history_write: &HistoryWriteArgs,
 ) -> Result<u8> {
     if provider_order.is_empty() {
         bail!("--providers must contain at least one provider");
@@ -908,7 +1219,7 @@ fn run_verify(
         let records = parse(&output)?;
         let record = records
             .iter()
-            .find(|record| !record.is_provenance() && record.entry_key == key)
+            .find(|record| !record.is_system() && record.entry_key == key)
             .cloned()
             .with_context(|| format!("citation key not found: {key}"))?;
         let summary = provenance::summary(&record, &records);
@@ -1021,6 +1332,7 @@ fn run_verify(
                             resolution
                                 .as_ref()
                                 .and_then(|report| report.exact_candidate().ok()),
+                            None,
                             true,
                         ) {
                             Ok((updated, _)) => {
@@ -1094,7 +1406,7 @@ fn run_verify(
         };
         let query = BibliographicQuery::from_record(&record);
         match backends[&search_provider].search(&query, limit) {
-            Ok(candidates) => {
+            Ok(search) => {
                 needs_review = true;
                 rows.push(VerifyRow {
                     id: key,
@@ -1103,7 +1415,8 @@ fn run_verify(
                     provider_id: None,
                     error: None,
                     resolution: None,
-                    candidates: candidates
+                    candidates: search
+                        .candidates
                         .into_iter()
                         .map(|candidate| planned_candidate(&record, candidate))
                         .collect(),
@@ -1125,7 +1438,7 @@ fn run_verify(
     }
 
     if in_place && output != original {
-        atomic_write_if_unchanged(file, &original, &output)?;
+        commit_edit(file, &original, &output, "source-verify", history_write)?;
         eprintln!(
             "provider-verified {} of {} selected entries in {}",
             rows.iter()
@@ -1139,11 +1452,17 @@ fn run_verify(
     Ok(if needs_review { 3 } else { 0 })
 }
 
+struct SelectionEvidence {
+    search: Record,
+    selection: Record,
+}
+
 fn reconcile_fetched(
     source: &str,
     key: &str,
     fetched: &providers::FetchedRecord,
     resolution_candidate: Option<&resolver::ResolutionCandidate>,
+    selection_evidence: Option<&SelectionEvidence>,
     add_integrity: bool,
 ) -> Result<(String, String)> {
     if let Some(candidate) = resolution_candidate
@@ -1159,11 +1478,12 @@ fn reconcile_fetched(
     let resolution_source = resolution_candidate
         .map(provenance::resolution_source)
         .transpose()?;
-    let provider_source = provenance::provider_source_with_resolution(
+    let provider_source = provenance::provider_source_with_evidence(
         fetched,
         resolution_source
             .as_ref()
             .map(|source| source.entry_key.as_str()),
+        selection_evidence.map(|evidence| evidence.selection.entry_key.as_str()),
     );
     let mut fields = fetched.record.bibtex_fields();
     fields.insert(SOURCE_FIELD.to_owned(), provider_source.entry_key.clone());
@@ -1180,12 +1500,67 @@ fn reconcile_fetched(
         output = provenance::append_source(&output, resolution_source, &records)?;
         records = parse(&output)?;
     }
+    if let Some(evidence) = selection_evidence {
+        output = provenance::append_source(&output, &evidence.search, &records)?;
+        records = parse(&output)?;
+        output = provenance::append_source(&output, &evidence.selection, &records)?;
+        records = parse(&output)?;
+    }
     output = provenance::append_source(&output, &provider_source, &records)?;
     if add_integrity {
         let records = parse(&output)?;
         output = update_source(&output, &records, &BTreeSet::from([key.to_owned()]), false)?;
     }
     Ok((output, provider_source.entry_key))
+}
+
+fn identifier_from_bibtex_fields(
+    record: &Record,
+) -> Option<(LiteratureIdentifier, resolver::ResolutionCandidate)> {
+    for (field, value) in &record.fields {
+        if matches!(field.as_str(), "doi" | "url" | "integrity" | SOURCE_FIELD) {
+            continue;
+        }
+        if let Some((_, doi)) = resolver::identifiers_in_url(value).into_iter().next() {
+            let candidate = field_resolution_candidate(field, value, "doi", &doi);
+            return Some((LiteratureIdentifier::Doi(doi), candidate));
+        }
+        if let Some(arxiv_id) = resolver::arxiv_id_in_url(value) {
+            let candidate = field_resolution_candidate(field, value, "arxiv", &arxiv_id);
+            return Some((
+                LiteratureIdentifier::Doi(format!("10.48550/arXiv.{arxiv_id}")),
+                candidate,
+            ));
+        }
+    }
+    None
+}
+
+fn field_resolution_candidate(
+    field: &str,
+    value: &str,
+    kind: &str,
+    identifier: &str,
+) -> resolver::ResolutionCandidate {
+    let input = format!("{field}:{value}");
+    resolver::ResolutionCandidate {
+        kind: kind.to_owned(),
+        value: identifier.to_owned(),
+        confidence: resolver::ResolutionConfidence::Exact,
+        signals: vec![resolver::MatchSignal {
+            kind: format!("{kind}-in-{field}"),
+            value: identifier.to_owned(),
+        }],
+        evidence: resolver::ResolutionEvidence {
+            method: "bibtex-field".to_owned(),
+            input_url: input.clone(),
+            final_url: input,
+            request_url: None,
+            media_type: None,
+            response_sha256: None,
+            response_bytes: 0,
+        },
+    }
 }
 
 fn planned_candidate(record: &Record, candidate: Candidate) -> PlannedCandidate {
@@ -1224,7 +1599,7 @@ fn select_records(records: &[Record], keys: Vec<String>, all: bool) -> Result<Ve
     ensure_keys_exist(records, &selected)?;
     Ok(records
         .iter()
-        .filter(|record| !record.is_provenance() && (all || selected.contains(&record.entry_key)))
+        .filter(|record| !record.is_system() && (all || selected.contains(&record.entry_key)))
         .collect())
 }
 
@@ -1252,7 +1627,7 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             let bibliography: Vec<_> = records
                 .iter()
                 .filter(|record| {
-                    !record.is_provenance()
+                    !record.is_system()
                         && (selected.is_empty() || selected.contains(&record.entry_key))
                 })
                 .collect();
@@ -1292,7 +1667,7 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             let records = parse(&source)?;
             let record = records
                 .iter()
-                .find(|record| record.entry_key == key)
+                .find(|record| !record.is_system() && record.entry_key == key)
                 .with_context(|| format!("citation key not found: {key}"))?;
             println!("{}", hash(record)?);
             Ok(0)
@@ -1306,6 +1681,7 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             source,
             agent,
             reviewer,
+            history_write,
         } => add_integrity(
             &file,
             merge_keys(key, keys_from)?,
@@ -1314,6 +1690,7 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             source,
             agent,
             reviewer,
+            &history_write,
         ),
         IntegrityCommand::Remove {
             file,
@@ -1321,10 +1698,143 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
             keys_from,
             all,
             in_place,
-        } => remove_integrity(&file, merge_keys(key, keys_from)?, all, in_place),
+            history_write,
+        } => remove_integrity(
+            &file,
+            merge_keys(key, keys_from)?,
+            all,
+            in_place,
+            &history_write,
+        ),
     }
 }
 
+fn run_history(command: HistoryCommand) -> Result<u8> {
+    match command {
+        HistoryCommand::Status {
+            file,
+            history: history_path,
+            json,
+        } => {
+            let report = history::status(&file, history_path.as_deref())?;
+            if json {
+                print_serializable(&report, false)?;
+            } else {
+                println!(
+                    "{}\t{} revisions\t{} referenced\t{} orphaned\t{}",
+                    report.state,
+                    report.revisions,
+                    report.referenced,
+                    report.orphaned,
+                    report.lockfile
+                );
+                for error in &report.errors {
+                    println!("error\t{error}");
+                }
+            }
+            Ok(if report.valid { 0 } else { 3 })
+        }
+        HistoryCommand::Log {
+            file,
+            key,
+            history: history_path,
+            compact,
+        } => {
+            let revisions = history::log(&file, history_path.as_deref(), &key)?;
+            print_serializable(&revisions, compact)?;
+            Ok(0)
+        }
+        HistoryCommand::Show {
+            file,
+            revision,
+            history: history_path,
+        } => {
+            let snapshot = history::snapshot(&file, history_path.as_deref(), &revision)?;
+            print!("{}", render(&[snapshot])?);
+            Ok(0)
+        }
+        HistoryCommand::Diff {
+            file,
+            revision,
+            history: history_path,
+            compact,
+        } => {
+            let snapshot = history::snapshot(&file, history_path.as_deref(), &revision)?;
+            let revision_view = history::revision_view(&file, history_path.as_deref(), &revision)?;
+            let source = read_file(&file)?;
+            let records = parse(&source)?;
+            let current = records
+                .iter()
+                .find(|record| record.entry_key == snapshot.entry_key)
+                .with_context(|| format!("citation key not found: {}", snapshot.entry_key))?;
+            let mut field_names: BTreeSet<_> = snapshot.fields.keys().cloned().collect();
+            field_names.extend(current.fields.keys().cloned());
+            let field_changes: Vec<_> = field_names
+                .into_iter()
+                .filter_map(|field| {
+                    let old = snapshot.fields.get(&field);
+                    let new = current.fields.get(&field);
+                    (old != new)
+                        .then(|| serde_json::json!({"field": field, "old": old, "new": new}))
+                })
+                .collect();
+            let report = serde_json::json!({
+                "revision": revision_view,
+                "current_type": current.entry_type,
+                "snapshot_type": snapshot.entry_type,
+                "changes": field_changes,
+            });
+            print_serializable(&report, compact)?;
+            Ok(0)
+        }
+        HistoryCommand::Restore {
+            file,
+            revision,
+            in_place,
+            history_write,
+        } => {
+            let original = read_file(&file)?;
+            let snapshot = history::snapshot(&file, history_write.history.as_deref(), &revision)?;
+            let output = history::restore_record(
+                &file,
+                history_write.history.as_deref(),
+                &revision,
+                &original,
+            )?;
+            if in_place {
+                commit_edit(&file, &original, &output, "history-restore", &history_write)?;
+                eprintln!(
+                    "restored {} from {revision} in {}",
+                    snapshot.entry_key,
+                    file.display()
+                );
+            } else {
+                print!("{output}");
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn commit_edit(
+    file: &Path,
+    expected: &str,
+    output: &str,
+    operation: &str,
+    history_write: &HistoryWriteArgs,
+) -> Result<()> {
+    history::commit_edit(
+        file,
+        history_write.history.as_deref(),
+        expected,
+        output,
+        operation,
+        history_write.history_actor.as_deref(),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn add_integrity(
     file: &Path,
     keys: Vec<String>,
@@ -1333,6 +1843,7 @@ fn add_integrity(
     source_kind: IntegritySourceArg,
     agent: Option<String>,
     reviewer: Option<String>,
+    history_write: &HistoryWriteArgs,
 ) -> Result<u8> {
     let actor = match source_kind {
         IntegritySourceArg::Provider => {
@@ -1383,22 +1894,46 @@ fn add_integrity(
         }
     }
     let output = update_source(&source, &records, &selected, false)?;
-    write_changed(file, &original, &output, &selected, in_place, "updated")
+    write_changed(
+        file,
+        &original,
+        &output,
+        &selected,
+        in_place,
+        "updated",
+        "integrity-add",
+        history_write,
+    )
 }
 
-fn remove_integrity(file: &Path, keys: Vec<String>, all: bool, in_place: bool) -> Result<u8> {
+fn remove_integrity(
+    file: &Path,
+    keys: Vec<String>,
+    all: bool,
+    in_place: bool,
+    history_write: &HistoryWriteArgs,
+) -> Result<u8> {
     let source = read_file(file)?;
     let records = parse(&source)?;
     let selected = selected_keys(&records, keys, all)?;
     let output = update_source(&source, &records, &selected, true)?;
-    write_changed(file, &source, &output, &selected, in_place, "removed")
+    write_changed(
+        file,
+        &source,
+        &output,
+        &selected,
+        in_place,
+        "removed",
+        "integrity-remove",
+        history_write,
+    )
 }
 
 fn selected_keys(records: &[Record], keys: Vec<String>, all: bool) -> Result<BTreeSet<String>> {
     let selected = if all {
         records
             .iter()
-            .filter(|record| !record.is_provenance())
+            .filter(|record| !record.is_system())
             .map(|record| record.entry_key.clone())
             .collect()
     } else {
@@ -1412,6 +1947,7 @@ fn selected_keys(records: &[Record], keys: Vec<String>, all: bool) -> Result<BTr
     Ok(selected)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_changed(
     file: &Path,
     expected: &str,
@@ -1419,9 +1955,11 @@ fn write_changed(
     selected: &BTreeSet<String>,
     in_place: bool,
     action: &str,
+    operation: &str,
+    history_write: &HistoryWriteArgs,
 ) -> Result<u8> {
     if in_place {
-        atomic_write_if_unchanged(file, expected, output)?;
+        commit_edit(file, expected, output, operation, history_write)?;
         eprintln!(
             "{action} integrity for {} entr{} in {}",
             selected.len(),
@@ -1429,7 +1967,8 @@ fn write_changed(
             file.display()
         );
     } else {
-        print!("{output}");
+        let preview = history::preview(file, history_write.history.as_deref(), output)?;
+        print_serializable(&preview, false)?;
     }
     Ok(0)
 }
@@ -1437,7 +1976,7 @@ fn write_changed(
 fn ensure_keys_exist(records: &[Record], selected: &BTreeSet<String>) -> Result<()> {
     let existing: BTreeSet<_> = records
         .iter()
-        .filter(|record| !record.is_provenance())
+        .filter(|record| !record.is_system())
         .map(|record| &record.entry_key)
         .collect();
     for key in selected {
@@ -1503,7 +2042,7 @@ fn read_bib_inputs_with_origins(files: &[PathBuf]) -> Result<Vec<LocatedRecord>>
         };
         let parsed = parse(&source)?;
         for record in &parsed {
-            if record.is_provenance() {
+            if record.is_system() {
                 continue;
             }
             if let Some(previous) =
@@ -1533,7 +2072,7 @@ fn parse_score(value: &str) -> Result<f64, String> {
 }
 
 fn read_file(path: &Path) -> Result<String> {
-    fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))
+    history::hydrate_file(path)
 }
 
 fn read_stdin(description: &str) -> Result<String> {

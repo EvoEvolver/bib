@@ -26,6 +26,14 @@ impl Record {
     pub fn is_provenance(&self) -> bool {
         self.entry_type.eq_ignore_ascii_case("bibsource")
     }
+
+    pub fn is_history(&self) -> bool {
+        self.entry_type.eq_ignore_ascii_case("bibversion")
+    }
+
+    pub fn is_system(&self) -> bool {
+        self.is_provenance() || self.is_history()
+    }
 }
 
 pub fn parse(source: &str) -> Result<Vec<Record>> {

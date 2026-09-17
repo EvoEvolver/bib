@@ -30,7 +30,7 @@ pub struct DedupeCandidate<'a> {
 pub fn candidates(records: &[LocatedRecord], min_score: f64) -> Vec<DedupeCandidate<'_>> {
     let bibliography: Vec<_> = records
         .iter()
-        .filter(|item| !item.record.is_provenance())
+        .filter(|item| !item.record.is_system())
         .filter_map(|item| {
             let title = item.record.fields.get("title")?;
             let author = item.record.fields.get("author")?;

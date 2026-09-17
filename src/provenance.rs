@@ -5,8 +5,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::bibtex::{Record, render};
+use crate::catalog::BibliographicQuery;
 use crate::integrity::content_hash;
-use crate::providers::FetchedRecord;
+use crate::providers::{FetchedRecord, FetchedSearch};
 use crate::resolver::{self, ResolutionCandidate};
 
 pub const SOURCE_FIELD: &str = "bibsource";
@@ -73,15 +74,36 @@ pub struct ResolutionSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct EvidenceTrace {
     pub target: String,
-    pub provider: EvidenceNode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<EvidenceNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web: Option<EvidenceNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<EvidenceNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<EvidenceNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<EvidenceNode>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EvidenceNode {
     pub key: String,
     pub fields: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct SearchCandidateReceipt<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    authors: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    year: Option<i32>,
+    projection_sha256: String,
 }
 
 impl SourceKind {
@@ -102,6 +124,14 @@ pub fn provider_source_with_resolution(
     fetched: &FetchedRecord,
     resolution_key: Option<&str>,
 ) -> Record {
+    provider_source_with_evidence(fetched, resolution_key, None)
+}
+
+pub fn provider_source_with_evidence(
+    fetched: &FetchedRecord,
+    resolution_key: Option<&str>,
+    selection_key: Option<&str>,
+) -> Record {
     let response_sha256 = sha256(&fetched.response);
     let projection = "literature-record-v1";
     let projection_sha256 = projection_hash(
@@ -119,6 +149,7 @@ pub fn provider_source_with_resolution(
         response_sha256: &response_sha256,
         projection_sha256: Some(&projection_sha256),
         resolution_key,
+        selection_key,
     });
     let key = format!("bibsource:provider:{identity}");
     let mut fields = BTreeMap::from([
@@ -135,11 +166,123 @@ pub fn provider_source_with_resolution(
     if let Some(resolution_key) = resolution_key {
         fields.insert("resolution".to_owned(), resolution_key.to_owned());
     }
+    if let Some(selection_key) = selection_key {
+        fields.insert("selection".to_owned(), selection_key.to_owned());
+    }
     Record {
         entry_type: SOURCE_TYPE.to_owned(),
         entry_key: key,
         fields,
     }
+}
+
+pub fn search_source(
+    target: &Record,
+    query: &BibliographicQuery,
+    search: &FetchedSearch,
+    provider: &str,
+) -> Result<Record> {
+    let candidates = search
+        .candidates
+        .iter()
+        .map(|candidate| SearchCandidateReceipt {
+            id: &candidate.record.id,
+            score: candidate.score,
+            title: candidate.record.title.as_deref(),
+            authors: candidate
+                .record
+                .authors
+                .iter()
+                .map(|author| author.family.as_str())
+                .collect(),
+            year: candidate.record.issued.as_ref().map(|date| date.year),
+            projection_sha256: projection_hash(
+                candidate.record.bibtex_type(),
+                &candidate.record.bibtex_fields(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let mut fields = BTreeMap::from([
+        ("kind".to_owned(), "search".to_owned()),
+        ("provider".to_owned(), provider.to_owned()),
+        ("target".to_owned(), target.entry_key.clone()),
+        ("inputsha256".to_owned(), content_hash(target)?),
+        ("query".to_owned(), query.citation.clone()),
+        ("candidates".to_owned(), serde_json::to_string(&candidates)?),
+        ("requesturl".to_owned(), search.request_url.clone()),
+        ("mediatype".to_owned(), search.media_type.clone()),
+        ("responsesha256".to_owned(), sha256(&search.response)),
+        (
+            "toolversion".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        ),
+    ]);
+    let identity = evidence_identity(&fields);
+    Ok(Record {
+        entry_type: SOURCE_TYPE.to_owned(),
+        entry_key: format!("bibsource:search:{identity}"),
+        fields: std::mem::take(&mut fields),
+    })
+}
+
+pub fn selection_source(search: &Record, selected_id: &str, selected_by: &str) -> Result<Record> {
+    let selected_by = selected_by.trim();
+    if selected_by.is_empty() {
+        bail!("selection actor cannot be empty");
+    }
+    if !search_candidate_ids(required(search, "candidates")?)?
+        .iter()
+        .any(|candidate_id| candidate_id.eq_ignore_ascii_case(selected_id))
+    {
+        bail!("selected provider id was not present in the recorded search candidates");
+    }
+    let mut fields = BTreeMap::from([
+        ("kind".to_owned(), "selection".to_owned()),
+        ("search".to_owned(), search.entry_key.clone()),
+        ("selectedid".to_owned(), selected_id.to_owned()),
+        ("selectedby".to_owned(), selected_by.to_owned()),
+        ("method".to_owned(), "agent-review".to_owned()),
+        (
+            "toolversion".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        ),
+    ]);
+    let identity = evidence_identity(&fields);
+    Ok(Record {
+        entry_type: SOURCE_TYPE.to_owned(),
+        entry_key: format!("bibsource:selection:{identity}"),
+        fields: std::mem::take(&mut fields),
+    })
+}
+
+pub fn web_source(target: &Record, evidence: &resolver::WebEvidence) -> Result<Record> {
+    let mut fields = BTreeMap::from([
+        ("kind".to_owned(), "web".to_owned()),
+        ("target".to_owned(), target.entry_key.clone()),
+        ("contenthash".to_owned(), content_hash(target)?),
+        ("inputurl".to_owned(), evidence.input_url.clone()),
+        ("requesturl".to_owned(), evidence.request_url.clone()),
+        ("finalurl".to_owned(), evidence.final_url.clone()),
+        ("mediatype".to_owned(), evidence.media_type.clone()),
+        (
+            "responsesha256".to_owned(),
+            evidence.response_sha256.clone(),
+        ),
+        (
+            "responsebytes".to_owned(),
+            evidence.response_bytes.to_string(),
+        ),
+        (
+            "toolversion".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        ),
+    ]);
+    let identity = evidence_identity(&fields);
+    Ok(Record {
+        entry_type: SOURCE_TYPE.to_owned(),
+        entry_key: format!("bibsource:web:{identity}"),
+        fields: std::mem::take(&mut fields),
+    })
 }
 
 pub fn resolution_source(candidate: &ResolutionCandidate) -> Result<Record> {
@@ -239,7 +382,7 @@ pub fn validate(record: &Record, records: &[Record]) -> Result<()> {
         .fields
         .get(SOURCE_FIELD)
         .filter(|value| !value.trim().is_empty())
-        .context("missing bibsource provenance reference")?;
+        .context("missing provenance source reference")?;
     let source = records
         .iter()
         .find(|candidate| candidate.is_provenance() && candidate.entry_key == *source_key)
@@ -248,9 +391,43 @@ pub fn validate(record: &Record, records: &[Record]) -> Result<()> {
         "provider" => validate_provider(record, source, records),
         "agent" => validate_actor(record, source, "agent"),
         "human" => validate_actor(record, source, "human"),
-        "resolution" => bail!("resolution evidence cannot directly verify a BibTeX entry"),
+        "web" => validate_web(record, source),
+        "resolution" | "search" | "selection" => {
+            bail!("supporting evidence cannot directly verify a BibTeX entry")
+        }
         other => bail!("unknown provenance kind {other:?}"),
     }
+}
+
+fn validate_web(record: &Record, source: &Record) -> Result<()> {
+    if source.entry_key != format!("bibsource:web:{}", evidence_identity(&source.fields)) {
+        bail!("web provenance key does not match its metadata");
+    }
+    if required(source, "target")? != record.entry_key {
+        bail!("web provenance target does not match citation key");
+    }
+    if required(source, "contenthash")? != content_hash(record)? {
+        bail!("web provenance content snapshot no longer matches entry");
+    }
+    let entry_url = record
+        .fields
+        .get("url")
+        .context("web-verified entry has no URL")?;
+    if required(source, "inputurl")? != entry_url {
+        bail!("web provenance URL no longer matches entry URL");
+    }
+    required(source, "requesturl")?;
+    required(source, "finalurl")?;
+    required(source, "mediatype")?;
+    required_sha256(source, "responsesha256")?;
+    if required(source, "responsebytes")?
+        .parse::<usize>()
+        .unwrap_or(0)
+        == 0
+    {
+        bail!("web provenance has an invalid response byte count");
+    }
+    Ok(())
 }
 
 pub fn summary(record: &Record, records: &[Record]) -> SourceSummary {
@@ -281,13 +458,27 @@ pub fn trace(record: &Record, records: &[Record]) -> Result<EvidenceTrace> {
     let source_key = record
         .fields
         .get(SOURCE_FIELD)
-        .context("missing bibsource provenance reference")?;
+        .context("missing provenance source reference")?;
     let source = records
         .iter()
         .find(|candidate| candidate.is_provenance() && candidate.entry_key == *source_key)
         .with_context(|| format!("referenced provenance entry not found: {source_key}"))?;
-    if required(source, "kind")? != "provider" {
-        bail!("source trace is only available for provider provenance");
+    let source_kind = required(source, "kind")?;
+    if source_kind == "web" {
+        return Ok(EvidenceTrace {
+            target: record.entry_key.clone(),
+            provider: None,
+            web: Some(EvidenceNode {
+                key: source.entry_key.clone(),
+                fields: public_evidence_fields(source),
+            }),
+            resolution: None,
+            selection: None,
+            search: None,
+        });
+    }
+    if source_kind != "provider" {
+        bail!("source trace is only available for provider or web provenance");
     }
     let resolution = source
         .fields
@@ -303,13 +494,37 @@ pub fn trace(record: &Record, records: &[Record]) -> Result<EvidenceTrace> {
             })
         })
         .transpose()?;
+    let selection = source
+        .fields
+        .get("selection")
+        .map(|key| evidence_node(key, records, "selection"))
+        .transpose()?;
+    let search = selection
+        .as_ref()
+        .and_then(|selection| selection.fields.get("search"))
+        .map(|key| evidence_node(key, records, "search"))
+        .transpose()?;
     Ok(EvidenceTrace {
         target: record.entry_key.clone(),
-        provider: EvidenceNode {
+        provider: Some(EvidenceNode {
             key: source.entry_key.clone(),
             fields: public_evidence_fields(source),
-        },
+        }),
+        web: None,
         resolution,
+        selection,
+        search,
+    })
+}
+
+fn evidence_node(key: &str, records: &[Record], kind: &str) -> Result<EvidenceNode> {
+    let record = records
+        .iter()
+        .find(|candidate| candidate.is_provenance() && candidate.entry_key == key)
+        .with_context(|| format!("{kind} evidence not found: {key}"))?;
+    Ok(EvidenceNode {
+        key: record.entry_key.clone(),
+        fields: public_evidence_fields(record),
     })
 }
 
@@ -331,6 +546,7 @@ fn validate_provider(record: &Record, source: &Record, records: &[Record]) -> Re
             response_sha256: required_sha256(source, "responsesha256")?,
             projection_sha256: source.fields.get("projectionsha256").map(String::as_str),
             resolution_key: source.fields.get("resolution").map(String::as_str),
+            selection_key: source.fields.get("selection").map(String::as_str),
         })
     );
     if source.entry_key != expected_key {
@@ -346,6 +562,16 @@ fn validate_provider(record: &Record, source: &Record, records: &[Record]) -> Re
             && !required(resolution, "identifier")?.eq_ignore_ascii_case(provider_id)
         {
             bail!("resolved DOI does not match provider record id");
+        }
+    }
+    if let Some(selection_key) = source.fields.get("selection") {
+        let selection = records
+            .iter()
+            .find(|candidate| candidate.is_provenance() && candidate.entry_key == *selection_key)
+            .with_context(|| format!("selection evidence not found: {selection_key}"))?;
+        validate_selection(selection, records)?;
+        if !required(selection, "selectedid")?.eq_ignore_ascii_case(provider_id) {
+            bail!("selected provider id does not match provider record id");
         }
     }
     if record.fields.get("bibprovider").map(String::as_str) != Some(provider)
@@ -369,6 +595,72 @@ fn validate_provider(record: &Record, source: &Record, records: &[Record]) -> Re
         }
     }
     Ok(())
+}
+
+fn validate_search(source: &Record) -> Result<()> {
+    if required(source, "kind")? != "search" {
+        bail!("referenced search evidence has the wrong kind");
+    }
+    if source.entry_key != format!("bibsource:search:{}", evidence_identity(&source.fields)) {
+        bail!("search provenance key does not match its metadata");
+    }
+    required(source, "provider")?;
+    required(source, "target")?;
+    required_sha256(source, "inputsha256")?;
+    required(source, "query")?;
+    required(source, "requesturl")?;
+    required(source, "mediatype")?;
+    required_sha256(source, "responsesha256")?;
+    if search_candidate_ids(required(source, "candidates")?)?.is_empty() {
+        bail!("search evidence has no candidates");
+    }
+    Ok(())
+}
+
+fn validate_selection(source: &Record, records: &[Record]) -> Result<()> {
+    if required(source, "kind")? != "selection" {
+        bail!("referenced selection evidence has the wrong kind");
+    }
+    if source.entry_key != format!("bibsource:selection:{}", evidence_identity(&source.fields)) {
+        bail!("selection provenance key does not match its metadata");
+    }
+    if required(source, "method")? != "agent-review" {
+        bail!("unsupported selection method");
+    }
+    required(source, "selectedby")?;
+    let search_key = required(source, "search")?;
+    let search = records
+        .iter()
+        .find(|candidate| candidate.is_provenance() && candidate.entry_key == search_key)
+        .with_context(|| format!("search evidence not found: {search_key}"))?;
+    validate_search(search)?;
+    let selected_id = required(source, "selectedid")?;
+    if !search_candidate_ids(required(search, "candidates")?)?
+        .iter()
+        .any(|candidate_id| candidate_id.eq_ignore_ascii_case(selected_id))
+    {
+        bail!("selected provider id is absent from search evidence");
+    }
+    Ok(())
+}
+
+fn search_candidate_ids(value: &str) -> Result<Vec<String>> {
+    let candidates: serde_json::Value =
+        serde_json::from_str(value).context("search candidates are not valid JSON")?;
+    let candidates = candidates
+        .as_array()
+        .context("search candidates must be a JSON array")?;
+    candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .get("id")
+                .or_else(|| candidate.get("record").and_then(|record| record.get("id")))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .context("search candidate is missing its provider id")
+        })
+        .collect()
 }
 
 fn resolution_summary(key: &str, records: &[Record]) -> ResolutionSummary {
@@ -423,6 +715,22 @@ fn validate_resolution(source: &Record) -> Result<()> {
                 bail!("resolution URL does not contain the recorded arXiv identifier");
             }
         }
+        "bibtex-field" => match required(source, "identifierkind")? {
+            "doi" => {
+                if !resolver::identifiers_in_url(required(source, "inputurl")?).contains(&expected)
+                {
+                    bail!("BibTeX field does not contain the recorded DOI");
+                }
+            }
+            "arxiv" => {
+                if resolver::arxiv_id_in_url(required(source, "inputurl")?).as_deref()
+                    != Some(required(source, "identifier")?)
+                {
+                    bail!("BibTeX field does not contain the recorded arXiv identifier");
+                }
+            }
+            other => bail!("unsupported BibTeX field identifier kind: {other}"),
+        },
         "html-metadata" | "arxiv-atom" => {
             required(source, "requesturl")?;
             required(source, "finalurl")?;
@@ -482,6 +790,7 @@ struct ProviderIdentity<'a> {
     response_sha256: &'a str,
     projection_sha256: Option<&'a str>,
     resolution_key: Option<&'a str>,
+    selection_key: Option<&'a str>,
 }
 
 fn provider_identity(value: ProviderIdentity<'_>) -> String {
@@ -495,6 +804,7 @@ fn provider_identity(value: ProviderIdentity<'_>) -> String {
         response_sha256,
         projection_sha256,
         resolution_key,
+        selection_key,
     } = value;
     let mut identity = format!(
         "provider\0{provider}\0{provider_id}\0{request_url}\0{media_type}\0{projection}\0{tool_version}\0{response_sha256}"
@@ -507,13 +817,24 @@ fn provider_identity(value: ProviderIdentity<'_>) -> String {
         identity.push_str("\0resolution\0");
         identity.push_str(resolution_key);
     }
+    if let Some(selection_key) = selection_key {
+        identity.push_str("\0selection\0");
+        identity.push_str(selection_key);
+    }
     sha256(identity.as_bytes())
 }
 
 fn resolution_identity(fields: &BTreeMap<String, String>) -> String {
+    evidence_identity(fields)
+}
+
+fn evidence_identity(fields: &BTreeMap<String, String>) -> String {
     let mut input = Vec::new();
     for (field, value) in fields {
-        if matches!(field.as_str(), "response" | "responseencoding") {
+        if matches!(
+            field.as_str(),
+            "response" | "responseencoding" | crate::integrity::PREVIOUS_FIELD
+        ) {
             continue;
         }
         input.extend_from_slice(field.len().to_string().as_bytes());
@@ -535,7 +856,12 @@ fn public_evidence_fields(record: &Record) -> BTreeMap<String, String> {
     record
         .fields
         .iter()
-        .filter(|(field, _)| !matches!(field.as_str(), "response" | "responseencoding"))
+        .filter(|(field, _)| {
+            !matches!(
+                field.as_str(),
+                "response" | "responseencoding" | crate::integrity::PREVIOUS_FIELD
+            )
+        })
         .map(|(field, value)| (field.clone(), value.clone()))
         .collect()
 }
@@ -567,4 +893,43 @@ pub fn provenance_keys(records: &[Record]) -> BTreeSet<&str> {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_receipt_binds_url_and_entry_contents() {
+        let mut target = Record {
+            entry_type: "misc".to_owned(),
+            entry_key: "product".to_owned(),
+            fields: BTreeMap::from([
+                ("title".to_owned(), "Product page".to_owned()),
+                ("url".to_owned(), "https://example.com/product".to_owned()),
+            ]),
+        };
+        let evidence = resolver::WebEvidence {
+            input_url: "https://example.com/product".to_owned(),
+            request_url: "https://example.com/product".to_owned(),
+            final_url: "https://www.example.com/product".to_owned(),
+            media_type: "text/html".to_owned(),
+            response_sha256: sha256(b"response"),
+            response_bytes: 8,
+        };
+        let source = web_source(&target, &evidence).unwrap();
+        target
+            .fields
+            .insert(SOURCE_FIELD.to_owned(), source.entry_key.clone());
+        let records = vec![target.clone(), source];
+
+        validate(&target, &records).unwrap();
+        let trace = trace(&target, &records).unwrap();
+        assert!(trace.web.is_some());
+        assert!(trace.provider.is_none());
+        target
+            .fields
+            .insert("title".to_owned(), "Changed".to_owned());
+        assert!(validate(&target, &records).is_err());
+    }
 }

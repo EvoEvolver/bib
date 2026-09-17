@@ -16,10 +16,18 @@ pub struct FetchedRecord {
     pub response: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct FetchedSearch {
+    pub candidates: Vec<Candidate>,
+    pub request_url: String,
+    pub media_type: String,
+    pub response: Vec<u8>,
+}
+
 pub trait LiteratureProvider {
     fn name(&self) -> &'static str;
     fn lookup(&self, identifier: &LiteratureIdentifier) -> Result<FetchedRecord>;
-    fn search(&self, query: &BibliographicQuery, limit: usize) -> Result<Vec<Candidate>>;
+    fn search(&self, query: &BibliographicQuery, limit: usize) -> Result<FetchedSearch>;
 }
 
 pub fn names() -> &'static [&'static str] {

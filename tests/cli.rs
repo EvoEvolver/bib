@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use assert_cmd::Command;
@@ -21,9 +23,20 @@ const SAMPLE: &str = r#"% retained comment
 }
 "#;
 
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn read_lock(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(lock_path(path)).unwrap()).unwrap()
+}
+
 #[test]
 fn top_level_help_documents_inspect_pipe_and_review_workflow() {
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .arg("--help")
         .assert()
@@ -36,7 +49,7 @@ fn top_level_help_documents_inspect_pipe_and_review_workflow() {
                 .and(predicate::str::contains("INTEGRITY"))
                 .and(predicate::str::contains("EXIT STATUS"))
                 .and(predicate::str::contains(
-                    "bib integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place",
+                    "biblock integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place",
                 ))
                 .and(predicate::str::contains(
                     "does not provide arbitrary metadata editing",
@@ -46,32 +59,32 @@ fn top_level_help_documents_inspect_pipe_and_review_workflow() {
 
 #[test]
 fn inspect_help_defines_external_pipeline_contract() {
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["inspect", "--help"])
         .assert()
         .success()
         .stdout(
             predicate::str::contains("one JSON array")
-                .and(predicate::str::contains("bib inspect refs.bib | jq"))
+                .and(predicate::str::contains("biblock inspect refs.bib | jq"))
                 .and(predicate::str::contains("does not evaluate filters")),
         );
 }
 
 #[test]
 fn source_help_explains_provider_and_review_workflow() {
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["source", "--help"])
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("bib source verify refs.bib --all")
-                .and(predicate::str::contains("bib source plan refs.bib"))
-                .and(predicate::str::contains("@bibsource"))
+            predicate::str::contains("biblock source verify refs.bib --all")
+                .and(predicate::str::contains("biblock source plan refs.bib"))
+                .and(predicate::str::contains("FILE.lock"))
                 .and(predicate::str::contains("never embeds response"))
-                .and(predicate::str::contains("bib source trace"))
-                .and(predicate::str::contains("bib integrity add refs.bib")),
+                .and(predicate::str::contains("biblock source trace"))
+                .and(predicate::str::contains("biblock integrity add refs.bib")),
         );
 }
 
@@ -95,9 +108,9 @@ fn provider_apply_preserves_local_content_and_requires_later_review() {
         r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Provider title"],"author":[{"given":"Jane","family":"Doe"}],"container-title":["Provider Journal"],"issued":{"date-parts":[[2026]]}}}"#,
     );
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "apply"])
         .arg(&path)
         .args(["--key", "paper1", "--id", "10.1234/example", "--in-place"])
@@ -112,9 +125,12 @@ fn provider_apply_preserves_local_content_and_requires_later_review() {
     assert!(output.contains("title = {Provider title}"));
     assert!(output.contains("journal = {Provider Journal}"));
     assert!(output.contains("file = {/local/paper.pdf}"));
-    assert!(output.contains("bibprovider = {crossref}"));
-    assert!(output.contains("bibproviderid = {10.1234/example}"));
+    assert!(!output.contains("bibprovider"));
+    assert!(!output.contains("bibsource"));
     assert!(!output.contains("integrity ="));
+    let lock = read_lock(&path);
+    assert_eq!(lock["entries"]["paper1"]["provider"], "crossref");
+    assert_eq!(lock["entries"]["paper1"]["providerId"], "10.1234/example");
 }
 
 #[test]
@@ -127,9 +143,9 @@ fn provider_apply_does_not_write_invalid_bibtex() {
         r#"{"message":{"DOI":"10.1234/broken","type":"journal-article","title":["Unbalanced } title"]}}"#,
     );
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "apply"])
         .arg(&path)
         .args(["--key", "paper1", "--id", "10.1234/broken", "--in-place"])
@@ -144,7 +160,7 @@ fn provider_apply_does_not_write_invalid_bibtex() {
 
 #[test]
 fn inspect_emits_pipeline_ready_json_from_stdin() {
-    let output = Command::cargo_bin("bib")
+    let output = Command::cargo_bin("biblock")
         .unwrap()
         .args(["inspect", "-", "--json", "--compact"])
         .write_stdin(SAMPLE)
@@ -170,7 +186,7 @@ fn inspect_rejects_duplicate_keys_in_one_file() {
     )
     .unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["inspect"])
         .arg(&path)
@@ -187,7 +203,7 @@ fn inspect_rejects_duplicate_keys_across_files() {
     fs::write(&first, "@article{alpha, title={First}}\n").unwrap();
     fs::write(&second, "@book{alpha, title={Second}}\n").unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["inspect"])
         .arg(&first)
@@ -217,7 +233,7 @@ fn dedupe_emits_scored_pairs_for_agent_review() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("bib")
+    let output = Command::cargo_bin("biblock")
         .unwrap()
         .args(["dedupe"])
         .arg(&first)
@@ -242,7 +258,7 @@ fn dedupe_emits_scored_pairs_for_agent_review() {
 
 #[test]
 fn dedupe_succeeds_with_empty_json_when_no_pairs_match() {
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["dedupe", "--compact"])
         .write_stdin(
@@ -259,7 +275,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
     let path = directory.path().join("references.bib");
     fs::write(&path, SAMPLE).unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -268,7 +284,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         .code(3)
         .stdout(predicate::str::contains("unverified\talpha"));
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
@@ -286,7 +302,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
     let sealed = fs::read_to_string(&path).unwrap();
     assert!(sealed.starts_with("% retained comment\n@string"));
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -300,7 +316,7 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
         sealed.replace("title = {Alpha}", "title = {Changed}"),
     )
     .unwrap();
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -311,12 +327,370 @@ fn integrity_lifecycle_has_scriptable_exit_codes() {
 }
 
 #[test]
+fn in_place_edits_create_a_valid_history_chain() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    let history_path = lock_path(&path);
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--lock-actor",
+            "codex/test",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let edited = fs::read_to_string(&path).unwrap();
+    assert!(!edited.contains("bibprevious"));
+    assert!(!edited.contains("integrity"));
+    assert!(!edited.contains("bibsource"));
+    assert!(history_path.exists());
+    let ledger = fs::read_to_string(&history_path).unwrap();
+    let lock: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let revision = lock["entries"]["alpha"]["head"].as_str().unwrap();
+    assert_eq!(revision.len(), "rev:".len() + 8);
+    assert!(lock["revisions"][revision]["revisionSha256"].is_string());
+    assert!(lock["revisions"][revision]["snapshotSha256"].is_string());
+    assert_eq!(lock["revisions"][revision]["actor"], "codex/test");
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&history_path).unwrap(), ledger);
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .args(["--key", "alpha"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("verified\talpha"));
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "status"])
+        .arg(&path)
+        .args(["--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"valid\": true")
+                .and(predicate::str::contains("\"revisions\": 1"))
+                .and(predicate::str::contains("\"orphaned\": 0")),
+        );
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "remove"])
+        .arg(&path)
+        .args(["--key", "alpha", "--in-place"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "log"])
+        .arg(&path)
+        .args(["--key", "alpha", "--compact"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("integrity-remove")
+                .and(predicate::str::contains("integrity-add")),
+        );
+}
+
+#[test]
+fn history_restore_is_itself_reversible() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+    let first = read_lock(&path)["entries"]["alpha"]["head"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "restore"])
+        .arg(&path)
+        .args(["--revision", &first, "--in-place"])
+        .assert()
+        .success();
+
+    let restored = fs::read_to_string(&path).unwrap();
+    let records = biblock_cli::bibtex::parse(&restored).unwrap();
+    let alpha = records
+        .iter()
+        .find(|record| record.entry_key == "alpha")
+        .unwrap();
+    assert!(!alpha.fields.contains_key("integrity"));
+    assert!(!alpha.fields.contains_key("bibsource"));
+    assert!(!alpha.fields.contains_key("bibprevious"));
+    assert_ne!(
+        read_lock(&path)["entries"]["alpha"]["head"],
+        serde_json::Value::String(first)
+    );
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "log"])
+        .arg(&path)
+        .args(["--key", "alpha", "--compact"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("history-restore"));
+}
+
+#[test]
+fn dry_run_does_not_create_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);
+    assert!(!lock_path(&path).exists());
+}
+
+#[test]
+fn history_status_detects_ledger_tampering() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    let history_path = lock_path(&path);
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+    let ledger = fs::read_to_string(&history_path).unwrap();
+    fs::write(
+        &history_path,
+        ledger.replace("\"revisionSha256\": \"", "\"revisionSha256\": \"0"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "status"])
+        .arg(&path)
+        .assert()
+        .code(3)
+        .stdout(
+            predicate::str::contains("revision")
+                .and(predicate::str::contains("hash does not match")),
+        );
+}
+
+#[test]
+fn json_lockfile_supports_sync_frozen_and_external_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(&path, SAMPLE).unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["lock"])
+        .arg(&path)
+        .arg("--frozen")
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("\"state\": \"unlocked\""));
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["lock"])
+        .arg(&path)
+        .args(["--sync", "--actor", "test-human"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\": \"locked\""));
+
+    let lock = read_lock(&path);
+    assert_eq!(lock["lockfileVersion"], "1.0");
+    assert_eq!(lock["toolVersion"], "0.9.0");
+    assert!(lock["bibliography"]["contentHash"].is_string());
+    assert!(lock["entries"]["alpha"]["contentHash"].is_string());
+    assert_eq!(fs::read_to_string(&path).unwrap(), SAMPLE);
+
+    fs::write(
+        &path,
+        SAMPLE.replace("title = {Alpha}", "title = {Changed}"),
+    )
+    .unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["lock"])
+        .arg(&path)
+        .arg("--frozen")
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("\"state\": \"stale\""));
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "add"])
+        .arg(&path)
+        .args([
+            "--key",
+            "alpha",
+            "--source",
+            "agent",
+            "--agent",
+            "test-agent",
+            "--in-place",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("run `biblock lock"));
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["lock"])
+        .arg(&path)
+        .args(["--sync", "--actor", "test-human"])
+        .assert()
+        .success();
+    let lock = read_lock(&path);
+    let head = lock["entries"]["alpha"]["head"].as_str().unwrap();
+    assert_eq!(head.len(), "rev:".len() + 8);
+    assert_eq!(lock["revisions"][head]["operation"], "lock-sync");
+    assert_eq!(lock["revisions"][head]["actor"], "test-human");
+}
+
+#[test]
+fn sync_migrates_legacy_embedded_workflow_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    let original = "@article{alpha, title={Alpha}}\n";
+    let records = biblock_cli::bibtex::parse(original).unwrap();
+    let evidence = biblock_cli::provenance::actor_source(
+        biblock_cli::provenance::SourceKind::Agent,
+        "legacy-agent",
+        &records[0],
+    )
+    .unwrap();
+    let with_source =
+        biblock_cli::provenance::append_source(original, &evidence, &records).unwrap();
+    let linked = biblock_cli::integrity::update_entry_fields(
+        &with_source,
+        "alpha",
+        "article",
+        &std::collections::BTreeMap::from([("bibsource".to_owned(), evidence.entry_key)]),
+    )
+    .unwrap();
+    let records = biblock_cli::bibtex::parse(&linked).unwrap();
+    let legacy = biblock_cli::integrity::update_source(
+        &linked,
+        &records,
+        &BTreeSet::from(["alpha".to_owned()]),
+        false,
+    )
+    .unwrap();
+    fs::write(&path, legacy).unwrap();
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["lock"])
+        .arg(&path)
+        .arg("--sync")
+        .assert()
+        .success();
+
+    let clean = fs::read_to_string(&path).unwrap();
+    assert!(!clean.contains("bibsource"));
+    assert!(!clean.contains("integrity"));
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("verified\talpha\tagent\n");
+
+    fs::remove_file(lock_path(&path)).unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&path)
+        .assert()
+        .code(3)
+        .stdout("unverified\talpha\n");
+}
+
+#[test]
 fn add_requires_an_explicit_review_selection() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("references.bib");
     fs::write(&path, SAMPLE).unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
@@ -334,7 +708,7 @@ fn integrity_add_requires_explicit_provenance_kind() {
     let path = directory.path().join("references.bib");
     fs::write(&path, SAMPLE).unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
@@ -350,7 +724,7 @@ fn agent_integrity_creates_attributed_source_entry() {
     let path = directory.path().join("references.bib");
     fs::write(&path, SAMPLE).unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
@@ -367,11 +741,12 @@ fn agent_integrity_creates_attributed_source_entry() {
         .success();
 
     let output = fs::read_to_string(&path).unwrap();
-    assert!(output.contains("bibsource = {bibsource:agent:"));
-    assert!(output.contains("@bibsource"));
-    assert!(output.contains("kind = {agent}"));
-    assert!(output.contains("actor = {claude-code/test}"));
-    Command::cargo_bin("bib")
+    assert!(!output.contains("bibsource"));
+    assert!(!output.contains("integrity"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"kind\": \"agent\""));
+    assert!(lock_text.contains("\"actor\": \"claude-code/test\""));
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -380,7 +755,7 @@ fn agent_integrity_creates_attributed_source_entry() {
         .success()
         .stdout("verified\talpha\tagent\n");
 
-    let inspected = Command::cargo_bin("bib")
+    let inspected = Command::cargo_bin("biblock")
         .unwrap()
         .args(["inspect"])
         .arg(&path)
@@ -395,11 +770,11 @@ fn agent_integrity_creates_attributed_source_entry() {
     assert_eq!(entries[1]["id"], "beta");
 
     fs::write(
-        &path,
-        output.replace("actor = {claude-code/test}", "actor = {other-agent}"),
+        lock_path(&path),
+        lock_text.replace("claude-code/test", "other-agent"),
     )
     .unwrap();
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -415,7 +790,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
     let path = directory.path().join("references.bib");
     fs::write(&path, SAMPLE).unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
@@ -432,7 +807,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
         .assert()
         .success();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -442,7 +817,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
         .success()
         .stdout("verified\talpha\tagent\n");
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -453,7 +828,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
 
     let keys_path = directory.path().join("approved.keys");
     fs::write(&keys_path, "alpha\n").unwrap();
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "remove"])
         .arg(&path)
@@ -462,7 +837,7 @@ fn integrity_add_reads_agent_selected_keys_from_stdin() {
         .arg("--in-place")
         .assert()
         .success();
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -478,7 +853,7 @@ fn explicit_empty_keys_pipeline_is_rejected() {
     let path = directory.path().join("references.bib");
     fs::write(&path, SAMPLE).unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "add"])
         .arg(&path)
@@ -508,9 +883,9 @@ fn crossref_pipeline_records_compact_receipt_and_adds_valid_integrity() {
     let body = r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Provider title"],"author":[{"given":"Jane","family":"Doe"}],"issued":{"date-parts":[[2026]]}}}"#;
     let base_url = mock_crossref(body);
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "apply"])
         .arg(&path)
         .args(["--key", "paper1", "--add-integrity", "--in-place"])
@@ -518,22 +893,25 @@ fn crossref_pipeline_records_compact_receipt_and_adds_valid_integrity() {
         .success();
 
     let output = fs::read_to_string(&path).unwrap();
-    assert!(output.contains("kind = {provider}"));
-    assert!(output.contains("provider = {crossref}"));
-    assert!(output.contains("mediatype = {application/vnd.crossref-api-message+json}"));
-    assert!(output.contains("responsesha256 = {"));
-    assert!(output.contains("projectionsha256 = {"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"kind\": \"provider\""));
+    assert!(lock_text.contains("\"provider\": \"crossref\""));
+    assert!(lock_text.contains("application/vnd.crossref-api-message+json"));
+    assert!(lock_text.contains("\"responsesha256\""));
+    assert!(lock_text.contains("\"projectionsha256\""));
+    assert!(!output.contains("bibsource"));
+    assert!(!output.contains("integrity"));
     assert!(!output.contains("responseencoding ="));
     assert!(!output.contains("response ="));
     assert!(!output.contains("volume = {stale}"));
     assert!(!output.contains("pages = {1--2}"));
-    let parsed = bib_cli::bibtex::parse(&output).unwrap();
+    let parsed = biblock_cli::bibtex::parse(&output).unwrap();
     let paper = parsed
         .iter()
         .find(|record| record.entry_key == "paper1")
         .unwrap();
     assert_eq!(paper.fields.get("note").map(String::as_str), Some("local"));
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -541,7 +919,7 @@ fn crossref_pipeline_records_compact_receipt_and_adds_valid_integrity() {
         .success()
         .stdout("verified\tpaper1\tprovider\n");
 
-    let trace = Command::cargo_bin("bib")
+    let trace = Command::cargo_bin("biblock")
         .unwrap()
         .args(["source", "trace"])
         .arg(&path)
@@ -557,11 +935,11 @@ fn crossref_pipeline_records_compact_receipt_and_adds_valid_integrity() {
     assert!(trace["provider"]["fields"].get("response").is_none());
 
     fs::write(
-        &path,
-        output.replace("projectionsha256 = {", "projectionsha256 = {0"),
+        lock_path(&path),
+        lock_text.replace("\"projectionsha256\": \"", "\"projectionsha256\": \"0"),
     )
     .unwrap();
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(&path)
@@ -584,9 +962,9 @@ fn verify_batches_exact_dois_into_one_write() {
         r#"{"message":{"DOI":"10.1234/b","type":"journal-article","title":["Beta"]}}"#,
     ]);
 
-    let output = Command::cargo_bin("bib")
+    let output = Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "verify"])
         .arg(&path)
         .args([
@@ -610,7 +988,7 @@ fn verify_batches_exact_dois_into_one_write() {
             .all(|row| row["status"] == "verified")
     );
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(path)
@@ -634,10 +1012,10 @@ fn verify_falls_back_from_crossref_to_doi_provider() {
         "@article{x, title={Raw DOI title}, doi={10.48550/arXiv.2401.01234}}",
     );
 
-    let output = Command::cargo_bin("bib")
+    let output = Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", crossref_url)
-        .env("BIB_DOI_API_BASE", doi_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", crossref_url)
+        .env("BIBLOCK_DOI_API_BASE", doi_url)
         .args(["source", "verify"])
         .arg(&path)
         .args(["--all", "--in-place", "--compact"])
@@ -649,14 +1027,16 @@ fn verify_falls_back_from_crossref_to_doi_provider() {
     let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(rows[0]["provider"], "doi");
     assert_eq!(rows[0]["status"], "verified");
-    let updated = fs::read_to_string(path).unwrap();
-    assert!(updated.contains("bibprovider = {doi}"));
-    assert!(updated.contains("method = {arxiv-url}"));
+    let updated = fs::read_to_string(&path).unwrap();
+    assert!(!updated.contains("bibprovider"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"provider\": \"doi\""));
+    assert!(lock_text.contains("\"method\": \"arxiv-url\""));
 }
 
 #[test]
 fn resolves_doi_url_without_network_access() {
-    let output = Command::cargo_bin("bib")
+    let output = Command::cargo_bin("biblock")
         .unwrap()
         .args([
             "source",
@@ -686,7 +1066,7 @@ fn strip_responses_migrates_legacy_evidence_without_reformatting() {
     )
     .unwrap();
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["source", "strip-responses"])
         .arg(&path)
@@ -695,11 +1075,14 @@ fn strip_responses_migrates_legacy_evidence_without_reformatting() {
         .success()
         .stderr(predicate::str::contains("removed 2 legacy response field"));
 
-    let output = fs::read_to_string(path).unwrap();
-    assert!(output.starts_with("% keep\n@bibsource"));
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(output.starts_with("% keep\n"));
+    assert!(!output.contains("@bibsource"));
     assert!(!output.contains("responseencoding"));
     assert!(!output.contains("response={"));
-    assert!(output.contains("responsesha256={abc}"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"responsesha256\": \"abc\""));
+    assert!(!lock_text.contains("responseencoding"));
 }
 
 #[test]
@@ -714,9 +1097,9 @@ fn apply_resolves_entry_url_and_records_linked_receipts() {
     let body = r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Resolved title"],"issued":{"date-parts":[[2026]]}}}"#;
     let base_url = mock_crossref(body);
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "apply"])
         .arg(&path)
         .args(["--key", "paper1", "--add-integrity", "--in-place"])
@@ -724,15 +1107,17 @@ fn apply_resolves_entry_url_and_records_linked_receipts() {
         .success();
 
     let output = fs::read_to_string(&path).unwrap();
-    assert!(output.contains("kind = {resolution}"));
-    assert!(output.contains("method = {url-doi}"));
-    assert!(output.contains("identifier = {10.1234/example}"));
-    assert!(output.contains("resolution = {bibsource:resolution:"));
-    assert!(output.contains("projectionsha256 = {"));
+    assert!(!output.contains("bibsource"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"kind\": \"resolution\""));
+    assert!(lock_text.contains("\"method\": \"url-doi\""));
+    assert!(lock_text.contains("\"identifier\": \"10.1234/example\""));
+    assert!(lock_text.contains("bibsource:resolution:"));
+    assert!(lock_text.contains("\"projectionsha256\""));
     assert!(!output.contains("responseencoding ="));
     assert!(!output.contains("response ="));
 
-    let trace = Command::cargo_bin("bib")
+    let trace = Command::cargo_bin("biblock")
         .unwrap()
         .args(["source", "trace"])
         .arg(&path)
@@ -749,7 +1134,82 @@ fn apply_resolves_entry_url_and_records_linked_receipts() {
         "10.1234/example"
     );
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(path)
+        .assert()
+        .success()
+        .stdout("verified\tpaper1\tprovider\n");
+}
+
+#[test]
+fn apply_records_search_selection_and_provider_chain() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{paper1, title={Selected title}, author={Doe, Jane}, year={2026}}\n",
+    )
+    .unwrap();
+    let base_url = mock_crossref_many(vec![
+        r#"{"message":{"items":[{"score":123.0,"DOI":"10.1234/selected","type":"journal-article","title":["Selected title"],"author":[{"family":"Doe","given":"Jane"}],"issued":{"date-parts":[[2026]]}}]}}"#,
+        r#"{"message":{"DOI":"10.1234/selected","type":"journal-article","title":["Selected title"],"author":[{"family":"Doe","given":"Jane"}],"issued":{"date-parts":[[2026]]}}}"#,
+    ]);
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args([
+            "--key",
+            "paper1",
+            "--id",
+            "10.1234/selected",
+            "--selected-by",
+            "codex",
+            "--add-integrity",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(!output.contains("bibsource"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"kind\": \"search\""));
+    assert!(lock_text.contains("\"kind\": \"selection\""));
+    assert!(lock_text.contains("\"selectedby\": \"codex\""));
+    assert!(lock_text.contains("bibsource:selection:"));
+    let lock: serde_json::Value = serde_json::from_str(&lock_text).unwrap();
+    let search = lock["sources"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|source| source["kind"] == "search")
+        .unwrap();
+    assert!(search["candidates"].is_array());
+
+    let trace = Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["source", "trace"])
+        .arg(&path)
+        .args(["--key", "paper1", "--compact"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    assert_eq!(
+        trace["selection"]["fields"]["selectedid"],
+        "10.1234/selected"
+    );
+    assert_eq!(trace["selection"]["fields"]["selectedby"], "codex");
+    assert_eq!(trace["search"]["fields"]["provider"], "crossref");
+
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(path)
@@ -771,9 +1231,9 @@ fn plan_resolves_entry_url_before_exact_provider_lookup() {
         r#"{"message":{"DOI":"10.1234/example","type":"journal-article","title":["Resolved title"]}}"#,
     );
 
-    let output = Command::cargo_bin("bib")
+    let output = Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "plan"])
         .arg(&path)
         .args(["--key", "paper1", "--compact"])
@@ -801,9 +1261,9 @@ fn apply_rejects_provider_record_that_disagrees_with_resolved_doi() {
         r#"{"message":{"DOI":"10.1234/different","type":"journal-article","title":["Wrong record"]}}"#,
     );
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_CROSSREF_API_BASE", base_url)
+        .env("BIBLOCK_CROSSREF_API_BASE", base_url)
         .args(["source", "apply"])
         .arg(&path)
         .args(["--key", "paper1", "--add-integrity", "--in-place"])
@@ -826,9 +1286,9 @@ fn doi_content_negotiation_pipeline_is_provider_backed() {
         "@article{remote, title={DOI title}, author={Doe, Jane}, year={2026}, doi={10.1234/example}}",
     );
 
-    Command::cargo_bin("bib")
+    Command::cargo_bin("biblock")
         .unwrap()
-        .env("BIB_DOI_API_BASE", base_url)
+        .env("BIBLOCK_DOI_API_BASE", base_url)
         .args(["source", "apply"])
         .arg(&path)
         .args([
@@ -844,15 +1304,55 @@ fn doi_content_negotiation_pipeline_is_provider_backed() {
 
     let output = fs::read_to_string(&path).unwrap();
     assert!(output.contains("title = {DOI title}"));
-    assert!(output.contains("provider = {doi}"));
-    assert!(output.contains("mediatype = {application/x-bibtex}"));
-    Command::cargo_bin("bib")
+    assert!(!output.contains("bibsource"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"provider\": \"doi\""));
+    assert!(lock_text.contains("application/x-bibtex"));
+    Command::cargo_bin("biblock")
         .unwrap()
         .args(["integrity", "status"])
         .arg(path)
         .assert()
         .success()
         .stdout("verified\tpaper1\tprovider\n");
+}
+
+#[test]
+fn apply_extracts_doi_from_a_nonstandard_bibtex_field() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("references.bib");
+    fs::write(
+        &path,
+        "@article{paper1, title={Preprint}, note={https://doi.org/10.48550/arXiv.2404.02060}}\n",
+    )
+    .unwrap();
+    let base_url = mock_response(
+        "application/x-bibtex",
+        "@article{remote, title={Published preprint}, doi={10.48550/arXiv.2404.02060}}",
+    );
+
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_DOI_API_BASE", base_url)
+        .args(["source", "apply"])
+        .arg(&path)
+        .args([
+            "--key",
+            "paper1",
+            "--provider",
+            "doi",
+            "--add-integrity",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+
+    let output = fs::read_to_string(&path).unwrap();
+    assert!(!output.contains("bibsource"));
+    let lock_text = fs::read_to_string(lock_path(&path)).unwrap();
+    assert!(lock_text.contains("\"method\": \"bibtex-field\""));
+    assert!(lock_text.contains("\"identifierkind\": \"doi\""));
+    assert!(lock_text.contains("\"provider\": \"doi\""));
 }
 
 fn mock_crossref(body: &'static str) -> String {

@@ -5,9 +5,9 @@ use reqwest::Url;
 use reqwest::blocking::Client;
 
 use crate::bibtex;
-use crate::catalog::{BibliographicQuery, Candidate, LiteratureIdentifier, LiteratureRecord};
+use crate::catalog::{BibliographicQuery, LiteratureIdentifier, LiteratureRecord};
 
-use super::{FetchedRecord, LiteratureProvider};
+use super::{FetchedRecord, FetchedSearch, LiteratureProvider};
 
 const DEFAULT_BASE_URL: &str = "https://doi.org/";
 const MEDIA_TYPE: &str = "application/x-bibtex";
@@ -20,12 +20,12 @@ pub struct DoiProvider {
 impl DoiProvider {
     pub fn new() -> Result<Self> {
         let base_url =
-            std::env::var("BIB_DOI_API_BASE").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+            std::env::var("BIBLOCK_DOI_API_BASE").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(20))
                 .user_agent(format!(
-                    "bib/{} (https://github.com/EvoEvolver/bib)",
+                    "biblock/{} (https://github.com/EvoEvolver/biblock)",
                     env!("CARGO_PKG_VERSION")
                 ))
                 .build()
@@ -81,7 +81,7 @@ impl LiteratureProvider for DoiProvider {
         })
     }
 
-    fn search(&self, _query: &BibliographicQuery, _limit: usize) -> Result<Vec<Candidate>> {
+    fn search(&self, _query: &BibliographicQuery, _limit: usize) -> Result<FetchedSearch> {
         bail!("the doi provider supports exact DOI lookup only; use crossref for search")
     }
 }
